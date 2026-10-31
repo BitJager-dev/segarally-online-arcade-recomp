@@ -282,6 +282,17 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
+# PORT_ASAN=ON: AddressSanitizer for the runtime, the SPU code and the runner -- not the
+# lifted PPU code (huge, and guest memory is not the host heap). A diagnostic build, in
+# its own build directory.
+option(PORT_ASAN "AddressSanitizer on the runtime and SPU code (diagnostic builds)" OFF)
+if(PORT_ASAN AND NOT MSVC)
+    target_compile_options(ps3recomp_runtime PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+    set_property(SOURCE ${SPU_SOURCES} main.cpp stubs.cpp APPEND PROPERTY COMPILE_OPTIONS
+                 -fsanitize=address -fno-omit-frame-pointer)
+    target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address)
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ps3recomp_runtime
 )

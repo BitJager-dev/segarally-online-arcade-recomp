@@ -252,7 +252,7 @@ index 298ee7d..ee722a0 100644
      }
      vm_write32(ctx + 8, cur + 4);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff601..780cdf5 100644
+index 8dff601..d2d4284 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -106,6 +106,9 @@ typedef struct {
@@ -265,7 +265,26 @@ index 8dff601..780cdf5 100644
      u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
      int guest_dirty;        /* rendered since guest memory last got a copy   */
      u32 last_use;           /* g.frames when last bound, sampled or presented */
-@@ -699,6 +702,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -319,6 +322,10 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
+ {
+     memset(rs, 0, sizeof(*rs));
+     rs->alpha_test_enable = rsx_dsp_reg(rsx, M_ALPHA_TEST_ENABLE) & 1;
++    /* NV4097_SET_ANTI_ALIASING_CONTROL (0x1D7C): bit 0 enable, bit 4 alpha
++     * to coverage. Only meaningful on an antialiased surface, but a 1x
++     * target keeps the hardware's single-sample rule (alpha > 1/2). */
++    rs->alpha_to_coverage = (rsx_dsp_reg(rsx, 0x1D7Cu) & 0x11u) == 0x11u;
+     rs->alpha_func   = rsx_dsp_reg(rsx, M_ALPHA_FUNC);
+     rs->alpha_ref_raw = rsx_dsp_reg(rsx, M_ALPHA_REF);
+     rsx_dsp_surface sf;
+@@ -398,6 +405,7 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
+     ENG_HASH_FIELD(bs_fail);
+     ENG_HASH_FIELD(bs_zfail);
+     ENG_HASH_FIELD(bs_zpass);
++    ENG_HASH_FIELD(alpha_to_coverage);
+     ENG_HASH_FIELD(depth_bounds_test);
+ #undef ENG_HASH_FIELD
+     return hash;
+@@ -699,6 +707,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
  
      eng_surface* s = &g.surfaces[slot];
      if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
@@ -273,7 +292,7 @@ index 8dff601..780cdf5 100644
      if (s->handle) g.be->color_target_release(g.be->user, s->handle);
      s->location = location; s->offset = offset;
      s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
-@@ -1083,12 +1087,12 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+@@ -1083,12 +1092,12 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
      const int z16 = z->zfmt == 1u;      /* SURFACE_FORMAT Z16 */
      const int bytes = base_fmt == RSX_TEX_FMT_A8R8G8B8 && !z16 && !rsx_texture_argb_is_rgba();
      const int d16 = base_fmt == RSX_TEX_FMT_DEPTH16 && z16;
@@ -288,7 +307,7 @@ index 8dff601..780cdf5 100644
      if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
          t->pitch != z->pitch)
          return 0;
-@@ -1097,7 +1101,9 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+@@ -1097,7 +1106,9 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
          const u32 tex = g.be->depth_as_color(g.be->user, z->handle, t->width, t->height,
                                               base_fmt);
          if (!tex) return 0;
@@ -299,7 +318,7 @@ index 8dff601..780cdf5 100644
          z->conv = tex;
          z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
          z->conv_serial = z->depth_serial;
-@@ -1322,9 +1328,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1322,9 +1333,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
   * cache full evicts the least recently used entry rather than returning
   * nothing: returning white "made the recovered orphanage render as flat
   * green/black geometry" (rsx_live_draw.c:2326-2334). */
@@ -328,7 +347,7 @@ index 8dff601..780cdf5 100644
      if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
      if (!depth) depth = 1;
      const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
-@@ -1372,6 +1397,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1372,6 +1402,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
               * stored hash becomes unknown and the next ordinary check
               * re-uploads once rather than miss a change. */
              if (e->rewritten && readable) {
@@ -336,7 +355,7 @@ index 8dff601..780cdf5 100644
                  hash = ~e->content_hash;
                  e->rewritten = 0;
              } else if (readable && (sparse != e->sparse_hash ||
-@@ -1382,6 +1408,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1382,6 +1413,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              if (readable) e->sparse_hash = sparse;
              e->last_hash_frame = g.frames;
              if (readable && hash != e->content_hash) {
@@ -347,7 +366,7 @@ index 8dff601..780cdf5 100644
                  /* In place when the backend orders the upload after the draws
                   * that sampled the old bytes; a volume keeps create-and-swap,
                   * and so does a different mip count (the key does not hold it,
-@@ -1412,7 +1442,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1412,7 +1447,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
                  index = i;
          evicted = g.textures[index].handle;
@@ -357,7 +376,7 @@ index 8dff601..780cdf5 100644
  
      eng_texture e;
      memset(&e, 0, sizeof(e));
-@@ -1661,6 +1693,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
+@@ -1661,6 +1698,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
      return mask;
  }
  
@@ -369,7 +388,19 @@ index 8dff601..780cdf5 100644
  /* Units bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3 with a
   * depth), declared Texture3D and sampled with three coordinates. Only when
   * the backend can create one: otherwise the first slice stays a 2D texture
-@@ -2564,6 +2601,29 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2076,6 +2118,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
+                                              rs->alpha_func) < 0)
+             fi = -1;
++        /* After the alpha test (which discards first), never both rewrites:
++         * each rewrites the final return. */
++        if (fi > 0 && rs->alpha_to_coverage && !rs->alpha_test_enable &&
++            rsx_fp_apply_alpha_to_coverage(s_ps_hlsl, sizeof s_ps_hlsl, wpos_grid[0], wpos_grid[1]) < 0)
++            fi = -1;
+     }
+     if (vi > 0 && fi > 0)
+         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
+@@ -2564,6 +2611,29 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              }
              continue;
          }
@@ -400,10 +431,18 @@ index 8dff601..780cdf5 100644
              g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
              eng_format_reinterprets_rgba8(base_fmt) &&
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index a25ecc2..5619b05 100644
+index a25ecc2..d7435fb 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
-@@ -281,6 +281,15 @@ typedef struct rsx_draw_backend {
+@@ -96,6 +96,7 @@ typedef struct rsx_be_render_state {
+     u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */
+     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
+     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
++    u32 alpha_to_coverage;          /* ANTI_ALIASING_CONTROL enable + alpha-to-coverage */
+ } rsx_be_render_state;
+ 
+ /* submit_and_wait reasons, for a backend that wants to log or count them. */
+@@ -281,6 +282,15 @@ typedef struct rsx_draw_backend {
       * owns the handle. 0 when the backend cannot; NULL keeps the store
       * through guest memory. */
      u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
@@ -419,6 +458,85 @@ index a25ecc2..5619b05 100644
  
      /* Optional, both or neither: clear_color and clear_depth_stencil limited
       * to the rectangle (x, y, w, h) of the target, in the engine's pixels
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index cfb9685..4fc306a 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -1569,6 +1569,58 @@ int rsx_fp_apply_alpha_test_buffered(
+     return 1;
+ }
+ 
++/* Alpha-to-coverage (SET_ANTI_ALIASING_CONTROL bit 4): the RSX turns the
++ * fragment's alpha into a sample mask. The engine renders an antialiased
++ * target at its sample grid -- one host pixel per sample -- so each host pixel
++ * is kept when alpha exceeds that sample's threshold: 2x2 ordered thresholds
++ * 1/8 5/8 7/8 3/8, 2x1 1/4 3/4, else 1/2. Without it, foliage cards and
++ * soft decals that rely on coverage alone drew as solid quads (SEGA Rally's
++ * flat green bushes and the bright square under its cars). Returns 1 when
++ * applied, 0 when there is nothing to do, -1 on failure. */
++int rsx_fp_apply_alpha_to_coverage(char* hlsl, u32 out_size, u32 grid_x, u32 grid_y)
++{
++    if (!hlsl || out_size == 0)
++        return -1;
++    char* marker = NULL;
++    for (char* p = strstr(hlsl, "    return "); p; p = strstr(p + 1, "    return "))
++        marker = p;
++    if (!marker)
++        return -1;
++    char* expression = marker + strlen("    return ");
++    char* terminator = strstr(expression, ";\n}\n");
++    if (!terminator || terminator == expression || (size_t)(terminator - expression) >= 96)
++        return -1;
++    char output[96];
++    memcpy(output, expression, (size_t)(terminator - expression));
++    output[terminator - expression] = '\0';
++    const int mrt = fp_returns_struct(hlsl);
++    const char* thr = (grid_x >= 2u && grid_y >= 2u)
++        ? "((_c.y ? ((_c.x) ? 0.375 : 0.875) : ((_c.x) ? 0.625 : 0.125)))"
++        : (grid_x >= 2u || grid_y >= 2u)
++        ? "(((grid_x_or_y) ? 0.75 : 0.25))"
++        : "0.5";
++    char thr_buf[160];
++    if (strstr(thr, "grid_x_or_y")) {
++        snprintf(thr_buf, sizeof thr_buf, "((%s) ? 0.75 : 0.25)", grid_x >= 2u ? "_c.x" : "_c.y");
++        thr = thr_buf;
++    }
++    char suffix[640];
++    const int n = snprintf(
++        suffix, sizeof(suffix),
++        "    %s _rsx_out = %s;\n"
++        "    { const uint2 _c = uint2(input.position.xy) & 1u;\n"
++        "      if (!(%s.w > %s)) discard; }\n"
++        "    return _rsx_out;\n}\n",
++        mrt ? "PSOutput" : "float4", output, mrt ? "_rsx_out.t0" : "_rsx_out", thr);
++    if (n < 0 || (u32)n >= sizeof(suffix))
++        return -1;
++    const size_t prefix = (size_t)(marker - hlsl);
++    if (prefix + (size_t)n + 1 > out_size)
++        return -1;
++    memcpy(marker, suffix, (size_t)n + 1);
++    return 1;
++}
++
+ /* --- kept from this tree when adopting the newer decompiler ---------------
+  * rsx_d3d12_backend.c calls both of these: extract_consts feeds the per-draw
+  * fp_k[] slots, code_hash keys the PSO cache on the ucode rather than the
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index e55bcc1..d4e169d 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -175,6 +175,11 @@ u64 rsx_fp_literal_source_hash(
+ int rsx_fp_apply_alpha_test_buffered(
+     char* hlsl, u32 out_size, u32 func);
+ 
++/* Alpha-to-coverage on a target held at its sample grid (grid_x x grid_y
++ * samples a pixel): discard a host pixel whose alpha does not exceed its
++ * sample's coverage threshold. */
++int rsx_fp_apply_alpha_to_coverage(char* hlsl, u32 out_size, u32 grid_x, u32 grid_y);
++
+ /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
+  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
+  * -1 when one allocation can never fit. */
 diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
 index e31b611..ba95911 100644
 --- a/libs/video/rsx_vertex_compact.c

@@ -1,5 +1,5 @@
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index 02b751b..ff80b0a 100644
+index 02b751b..ceb0fef 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
 @@ -20,6 +20,7 @@
@@ -10,7 +10,41 @@ index 02b751b..ff80b0a 100644
  #include "ps3emu/log_first.h"
  #include "ps3emu/thread_name.h"
  
-@@ -649,22 +650,56 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -180,7 +181,7 @@ static int audio_backend_init(void)
+     want.freq     = CELL_AUDIO_SAMPLE_RATE;
+     want.format   = AUDIO_F32SYS;
+     want.channels = 2;
+-    want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
++    want.samples  = CELL_AUDIO_BLOCK_SAMPLES * 4;   /* 21 ms: a 5 ms device buffer crackled on PipeWire */
+     want.callback = NULL; /* We'll use SDL_QueueAudio */
+ 
+     s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+@@ -209,12 +210,21 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+     }
+ }
+ 
+-/* SDL queues without bound: keep about four blocks ahead of the device. */
++/* SDL queues without bound: keep PS3_AUDIO_BUF_MS (default 64 ms, twelve
++ * blocks) ahead of the device. Four blocks (21 ms) underran PipeWire under
++ * load -- a shader compile, a busy core -- and every underrun is a pop. */
+ static int audio_backend_room(void)
+ {
+     if (!s_sdl_audio_dev) return -1;
+-    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
+-           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
++    static u32 ahead = 0;
++    if (!ahead) {
++        const char* e = getenv("PS3_AUDIO_BUF_MS");
++        const int ms = e && atoi(e) > 0 ? atoi(e) : 64;
++        ahead = (u32)ms * CELL_AUDIO_SAMPLE_RATE / 1000u;
++        if (ahead < CELL_AUDIO_BLOCK_SAMPLES * 2) ahead = CELL_AUDIO_BLOCK_SAMPLES * 2;
++    }
++    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) < ahead
++           ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+ }
+ 
+ static void audio_backend_wait(void) { SDL_Delay(1); }
+@@ -649,22 +659,56 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      return 0;
  }
  #else
