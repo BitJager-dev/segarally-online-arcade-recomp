@@ -1,0 +1,166 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 298ee7d..f31e07a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1492,6 +1492,9 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+ static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
+ static u32 s_cf_off[8], s_cf_w[8], s_cf_i;   /* last JUMP/CALL words, for GCM_CIRCLE_DUMP */
+ static u32 s_tr_i = 0;
++/* Drain passes leading up to a bad branch: where get started and where put was. */
++#define GCM_PUTHIST_N 32
++static u32 s_ph_get[GCM_PUTHIST_N], s_ph_put[GCM_PUTHIST_N], s_ph_ref[GCM_PUTHIST_N], s_ph_i;
+ 
+ /* A branch we cannot take leaves the walker pointing at whatever it
+  * mis-decoded, and it never recovers -- get freezes for the rest of the
+@@ -1700,6 +1703,11 @@ static void gcm_fifo_dump_around(u32 getoff)
+         fprintf(stderr, "[FIFODUMP] %+3d io=%08X w=%08X%s\n",
+                 k, io, vm_read32(ea), k ? "" : "   <-- bad word");
+     }
++    for (u32 t = 0; t < GCM_PUTHIST_N; t++) {
++        u32 k = (s_ph_i + t) % GCM_PUTHIST_N;
++        if (!s_ph_put[k] && !s_ph_get[k]) continue;
++        fprintf(stderr, "[PUTHIST] get=%08X put=%08X ref=%08X\n", s_ph_get[k], s_ph_put[k], s_ph_ref[k]);
++    }
+ }
+ 
+ 
+@@ -2000,6 +2008,16 @@ static int gcm_word_diag(void)
+ 
+ /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
+  * plus the methods whose answer the walker writes itself. */
++/* ZPASS counts from the backend, where it can count (rsx_vulkan_backend.c).
++ * Weak, so a backend without them links and keeps the 0xFFFF answer. */
++#if defined(__GNUC__) || defined(__clang__)
++extern uint32_t rsx_backend_zpass_report(void) __attribute__((weak));
++extern void rsx_backend_zpass_clear(void) __attribute__((weak));
++#else
++static uint32_t (*const rsx_backend_zpass_report)(void) = NULL;
++static void (*const rsx_backend_zpass_clear)(void) = NULL;
++#endif
++
+ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+ {
+     extern u32 g_rsx_last_reference;
+@@ -2020,9 +2038,29 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+      * reports "visible" -- the conservative answer; reading 0
+      * tells the title every queried object is occluded. */
+     if (m == 0x1A8) s_report_dma = v;
++    /* A backend that counts samples (rsx_vulkan_backend.c) answers ZPASS
++     * reports with the real count; CLEAR_REPORT_VALUE(1) restarts it. */
++    if (m == 0x17C8) { static int dbg = -1; static unsigned n_dbg = 0;
++                       if (dbg < 0) dbg = getenv("GCM_REPORT_DBG") ? 1 : 0;
++                       if (dbg && (n_dbg++ % 300) == 0) fprintf(stderr, "[CLEAR_REPORT] %u (#%u)%c", v, n_dbg, 10); }
++    if (m == 0x17CC) { static int dbg = -1; static unsigned n_dbg = 0;
++                       if (dbg < 0) dbg = getenv("GCM_REPORT_DBG") ? 1 : 0;
++                       if (dbg && (n_dbg++ % 300) == 0) fprintf(stderr, "[ZPASS_ENABLE] %u (#%u)%c", v, n_dbg, 10); }
++    if (m == 0x17C8 && v == 1u && rsx_backend_zpass_clear) rsx_backend_zpass_clear();
+     if (m == 0x1800) {
+         const u32 off = v & 0xFFFFFFu, idx = off / 16u;
+-        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
++        u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
++        if ((v >> 24) == 1u && rsx_backend_zpass_report) {
++            const u32 n = rsx_backend_zpass_report();
++            if (n != 0xFFFFFFFFu) val = n;
++        }
++        /* GCM_REPORT_DBG=1: per type, how many reports and the last value, every 600. */
++        { static int dbg = -1; static unsigned n_dbg = 0, cnt[8], last[8];
++          if (dbg < 0) dbg = getenv("GCM_REPORT_DBG") ? 1 : 0;
++          if (dbg) { const u32 t = (v >> 24) & 7u; cnt[t]++; last[t] = val;
++              if (++n_dbg % 600 == 0)
++                  fprintf(stderr, "[GET_REPORT] counts t1=%u(%u) t2=%u(%u) t3=%u(%u) t4=%u(%u) t5=%u(%u)%c",
++                          cnt[1], last[1], cnt[2], last[2], cnt[3], last[3], cnt[4], last[4], cnt[5], last[5], 10); } }
+         const u64 ts = gcm_report_timestamp();
+         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
+         { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+@@ -2122,6 +2160,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
+     }
+ 
+     u32 start_off = s_fifo_getoff;
++    { static int wd = -1; if (wd < 0) wd = getenv("GCM_WRAPDBG") ? 1 : 0;
++      if (wd && s_gcm_context_ea && put < s_fifo_getoff) {
++          u32 cio = gcm_ea2io(vm_read32(s_gcm_context_ea + 8));
++          static int n = 0;
++          if (cio != 0xFFFFFFFFu && cio > s_fifo_getoff && PS3_LOG_FIRST(n, 40))
++              fprintf(stderr, "[OVERRUN] title writing at io %08X past unread get=%08X (put %08X)\n",
++                      cio, s_fifo_getoff, put);
++      } }
++    if (put != s_ph_put[(s_ph_i + GCM_PUTHIST_N - 1) % GCM_PUTHIST_N]) {
++        s_ph_get[s_ph_i % GCM_PUTHIST_N] = s_fifo_getoff;
++        s_ph_put[s_ph_i % GCM_PUTHIST_N] = put;
++        s_ph_ref[s_ph_i % GCM_PUTHIST_N] = vm_read32(GCM_CONTROL_GUEST_ADDR + 8);
++        s_ph_i++;
++    }
+     /* GCM_DRAINDBG: log one drain pass in GCM_DRAINDBG_EVERY (default 60). */
+     static int s_drain_every = -1;
+     if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
+@@ -2165,10 +2217,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * bad branch, which is exactly the case where the drift is silent. */
+     { static int snap = -1;
+       if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
+-      if (snap > 0 && put) {
++      static int wrap_only = -1;
++      if (wrap_only < 0) wrap_only = getenv("GCM_FIFO_SNAP_WRAP") ? 1 : 0;
++      if (snap > 0 && put && (!wrap_only || put < s_fifo_getoff)) {
+           snap--;
+-          fprintf(stderr, "[SNAP] get=%08X put=%08X\n", s_fifo_getoff, put);
+-          for (int k = 0; k < 16; k++) {
++          fprintf(stderr, "[SNAP] get=%08X put=%08X ctx begin=%08X end=%08X cur=%08X cb=%08X\n",
++                  s_fifo_getoff, put, vm_read32(s_gcm_context_ea), vm_read32(s_gcm_context_ea + 4),
++                  vm_read32(s_gcm_context_ea + 8), vm_read32(s_gcm_context_ea + 12));
++          for (int k = wrap_only ? -8 : 0; k < (wrap_only ? 40 : 16); k++) {
+               u32 gio = s_fifo_getoff + (u32)(k * 4), pio = put + (u32)(k * 4);
+               u32 gea = gcm_io2ea(gio), pea = gcm_io2ea(pio);
+               fprintf(stderr, "[SNAP]  get+%-3d io=%08X w=%08X   put+%-3d io=%08X w=%08X\n",
+@@ -2398,7 +2454,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+         }
+         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+             { u32 tgt = w & 0x1FFFFFFCu;
+-              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
++              if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+               s_fifo_calloff = s_fifo_getoff + 4;
+               s_fifo_getoff  = tgt; }
+             continue;
+@@ -3171,10 +3227,26 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+     const u32 cb_opd = vm_read32(ctx + 0xC);
+     const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
++    /* The guest writes its next frame from `begin` straight away, so the walker
++     * has to be past that much of the ring already -- not just past a fixed
++     * margin. Sega Rally writes ~1 MB a frame into a 2 MB ring and the walker
++     * runs a frame behind: wrapping with get at 0xAA9B0 let the next frame
++     * overwrite commands not yet read, and the walker then decoded vertex data
++     * (JUMP 0x1F800000 from a float 1.0f) and drew garbage. When the walker is
++     * that far back, leave the wrap to the buffer-full callback, which waits. */
++    static u32 s_last_flip_io = 0xFFFFFFFFu, s_frame_bytes = 0;
++    const u32 cur_io = gcm_ea2io(cur);
++    if (s_last_flip_io != 0xFFFFFFFFu && cur_io > s_last_flip_io)
++        s_frame_bytes = cur_io - s_last_flip_io;
++    s_last_flip_io = cur_io;
+     if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+-        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
++        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN + s_frame_bytes &&
++        s_fifo_getoff <= cur_io) {
+         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+         vm_write32(ctx + 8, begin);
++        s_last_flip_io = io_begin;
++        { static int n = 0; if (getenv("GCM_WRAPDBG") && PS3_LOG_FIRST(n, 40))
++            fprintf(stderr, "[FLIPWRAP] at io %08X, walker get=%08X\n", gcm_ea2io(cur), s_fifo_getoff); }
+         return 1;
+     }
+     vm_write32(ctx + 8, cur + 4);
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 8dff601..e407ae8 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1661,6 +1661,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
+     return mask;
+ }
+ 
++/* NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE (0x17CC): is the title counting the
++ * samples its draws pass? A backend that answers ZPASS reports
++ * (rsx_vulkan_backend.c) wraps those draws in occlusion queries. */
++int rsx_engine_zpass_enabled(void) { return (rsx_dsp_reg(&g.rsx, 0x17CCu) & 1u) != 0; }
++
+ /* Units bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3 with a
+  * depth), declared Texture3D and sampled with three coordinates. Only when
+  * the backend can create one: otherwise the first slice stays a 2D texture

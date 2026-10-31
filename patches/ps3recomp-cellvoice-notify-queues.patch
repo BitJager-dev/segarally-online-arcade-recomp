@@ -1,0 +1,90 @@
+diff --git a/libs/audio/cellVoice.c b/libs/audio/cellVoice.c
+index 2a50981..808e56d 100644
+--- a/libs/audio/cellVoice.c
++++ b/libs/audio/cellVoice.c
+@@ -214,3 +214,70 @@ s32 cellVoiceGetSignalState(CellVoicePortId portId, u32 attr, void* attrValue)
+     /* RPCS3 reports a detached microphone and does not write attrValue. */
+     return (s32)CELL_VOICE_ERROR_DEVICE_NOT_PRESENT;
+ }
++
++/* Notify event queues (RPCS3 cellVoice.cpp semantics). A title's voice thread
++ * creates one and waits on it for port events. With no import for these, the
++ * id it waited on was never written, every receive failed at once, and Sega
++ * Rally's "voice thread" spun a core for the whole run. Create a real lv2
++ * queue -- nothing is ever sent to it without a microphone, so the thread
++ * blocks there as it would on hardware with no headset. */
++extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
++
++#define VOICE_MAX_QUEUES 8
++static uint64_t s_queue_keys[VOICE_MAX_QUEUES];
++static uint64_t s_queue_sources[VOICE_MAX_QUEUES];
++
++s32 cellVoiceCreateNotifyEventQueue(u32* id, u64* key)
++{
++    const u32 id_ea = (u32)(uintptr_t)id, key_ea = (u32)(uintptr_t)key;
++    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
++    if (!id_ea || !key_ea) return (s32)CELL_VOICE_ERROR_ARGUMENT_INVALID;
++    /* Keys distinct from cellAudio's (0x8000...) and from the title's own (0). */
++    static uint64_t s_next_key = 0x8000000056000001ull;
++    const uint64_t k = s_next_key++;
++    const uint32_t qid = sys_event_queue_create_direct(k, 32);
++    if (!qid) return (s32)CELL_VOICE_ERROR_OUT_OF_MEMORY;
++    vm_write32(id_ea, qid);
++    vm_write64(key_ea, k);
++    printf("[cellVoice] CreateNotifyEventQueue -> id=%u key=0x%llX\n", qid, (unsigned long long)k);
++    return CELL_OK;
++}
++
++s32 cellVoiceSetNotifyEventQueue(u64 key, u64 source)
++{
++    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
++    for (int i = 0; i < VOICE_MAX_QUEUES; i++) {
++        if (s_queue_keys[i] == key || !s_queue_keys[i]) {
++            s_queue_keys[i] = key;
++            s_queue_sources[i] = source;
++            return CELL_OK;
++        }
++    }
++    return (s32)CELL_VOICE_ERROR_ARGUMENT_INVALID;
++}
++
++s32 cellVoiceRemoveNotifyEventQueue(u64 key)
++{
++    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
++    for (int i = 0; i < VOICE_MAX_QUEUES; i++) {
++        if (s_queue_keys[i] == key) {
++            s_queue_keys[i] = 0;
++            s_queue_sources[i] = 0;
++            return CELL_OK;
++        }
++    }
++    return (s32)CELL_VOICE_ERROR_ARGUMENT_INVALID;
++}
++
++s32 cellVoiceSetBitRate(CellVoicePortId portId, u32 bitrate)
++{
++    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
++    if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
++    /* Only voice ports (IN_VOICE 2 / OUT_VOICE 4) carry a bitrate, at bytes 12..15. */
++    uint8_t* p = (uint8_t*)&s_ports[portId].param;
++    const u32 type = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
++    if (type != 2 && type != 4) return (s32)CELL_VOICE_ERROR_ARGUMENT_INVALID;
++    p[12] = (uint8_t)(bitrate >> 24); p[13] = (uint8_t)(bitrate >> 16);
++    p[14] = (uint8_t)(bitrate >> 8);  p[15] = (uint8_t)bitrate;
++    return CELL_OK;
++}
+diff --git a/libs/audio/cellVoice.h b/libs/audio/cellVoice.h
+index 8f6472d..96ddd69 100644
+--- a/libs/audio/cellVoice.h
++++ b/libs/audio/cellVoice.h
+@@ -90,6 +90,10 @@ s32 cellVoiceReadFromOPort(CellVoicePortId portId, void* data, u32* size);
+ s32 cellVoiceResetPort(CellVoicePortId portId);
+ s32 cellVoiceUpdatePort(CellVoicePortId portId, const CellVoicePortParam* param);
+ s32 cellVoiceGetSignalState(CellVoicePortId portId, u32 attr, void* attrValue);
++s32 cellVoiceCreateNotifyEventQueue(u32* id, u64* key);
++s32 cellVoiceSetNotifyEventQueue(u64 key, u64 source);
++s32 cellVoiceRemoveNotifyEventQueue(u64 key);
++s32 cellVoiceSetBitRate(CellVoicePortId portId, u32 bitrate);
+ 
+ s32 cellVoiceSetCallback(CellVoiceEventCallback callback, void* arg);
+ 

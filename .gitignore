@@ -1,0 +1,9 @@
+game/
+analysis/
+generated/
+out/
+.claude/settings.local.json
+setup_ps3.log
+run/
+logs/
+__pycache__/

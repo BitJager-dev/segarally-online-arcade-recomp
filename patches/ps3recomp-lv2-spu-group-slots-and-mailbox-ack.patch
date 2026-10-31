@@ -1,0 +1,119 @@
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 9626673..bb07d18 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -521,6 +521,14 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
+     }
+     if (num > 8) num = 8;
+     g->num_threads = num;
++    /* A group has eight thread slots whatever its size: lv2 takes any spu_num
++     * below 8 in sys_spu_thread_initialize (as RPCS3 does), and starting the
++     * group runs the slots that were filled. SEGA Rally Online Arcade creates
++     * its two-thread Physics group with spu_num 2 and 3; walking slots 0..num-1
++     * instead started thread-table entry 0 (its audio thread) twice and never
++     * the physics threads, and the main thread then waited for physics jobs
++     * for good. Unfilled slots hold MAX_SPU_THREADS, which every walk skips. */
++    for (int i = 0; i < 8; i++) g->thread_indices[i] = MAX_SPU_THREADS;
+ 
+     int32_t  gtype   = 0;
+     uint32_t name_ea = 0;
+@@ -706,6 +714,15 @@ static void spu_spawn_host_thread(spu_thread_handle_t* out,
+  * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
+  * that belongs to the group state machine: apply the classified stop to the
+  * thread and, for a GROUP_EXIT, to the group, then release group_join. */
++/* SPU_MB_ACK=<port>, or -1 when unset. See sys_spu_thread_write_spu_mb_handler. */
++static int spu_mb_ack_port(void)
++{
++    static int s_ack = -2;
++    if (s_ack == -2) { const char* e = getenv("SPU_MB_ACK"); s_ack = e ? (int)strtol(e, NULL, 0) : -1; }
++    return s_ack;
++}
++static void spu_mb_ack_dead(spu_thread_t* t, uint32_t port, uint32_t val);
++
+ #ifdef _WIN32
+ static DWORD WINAPI spu_exec_thread_proc(LPVOID arg)
+ #else
+@@ -735,13 +752,20 @@ static void* spu_exec_thread_proc(void* arg)
+ #ifdef _WIN32
+     t->running = 0;
+     SetEvent(t->finish_event);
+-    return 0;
+ #else
+     pthread_mutex_lock(&t->finish_event.mu);
+     t->running = 0;
+     t->finish_event.done = 1;
+     pthread_cond_broadcast(&t->finish_event.cv);
+     pthread_mutex_unlock(&t->finish_event.mu);
++#endif
++    /* A word written while the run was ending was never read; with
++     * SPU_MB_ACK, answer it as the mailbox handler answers later ones. */
++    if (spu_mb_ack_port() >= 0 && spu_channel_has_data(&t->sctx->ch_in_mbox))
++        spu_mb_ack_dead(t, (uint32_t)spu_mb_ack_port(), spu_channel_read(&t->sctx->ch_in_mbox));
++#ifdef _WIN32
++    return 0;
++#else
+     return NULL;
+ #endif
+ }
+@@ -1026,7 +1050,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+     int spawned = 0;
+     int instant = 0;
+     int nofb    = 0;   /* subset of `instant` that had no fallback at all */
+-    for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
++    for (uint32_t i = 0; i < 8; i++) {
+         uint32_t idx = g->thread_indices[i];
+         if (idx >= MAX_SPU_THREADS) continue;
+         spu_thread_t* t = &s_spu_threads[idx];
+@@ -1261,7 +1285,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
+      * back results. */
+     if (g->state == SPU_GROUP_STATE_RUNNING) {
+         int32_t worst = 0;
+-        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
++        for (int i = 0; i < 8; i++) {
+             uint32_t idx = g->thread_indices[i];
+             if (idx >= MAX_SPU_THREADS) continue;
+             spu_thread_t* t = &s_spu_threads[idx];
+@@ -1340,7 +1364,7 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
+     }
+     spu_group_t* g = spu_find_group(id);
+     if (g) {
+-        for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
++        for (int i = 0; i < 8; i++) {
+             uint32_t idx = g->thread_indices[i];
+             if (idx < MAX_SPU_THREADS) {
+                 spu_thread_t* t = &s_spu_threads[idx];
+@@ -1493,6 +1517,18 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
+         return CELL_OK;
+     }
+ 
++    /* SPU_MB_ACK=<port>: a lifted thread whose run has ended (it faulted, or an
++     * image it needs could not be lifted) has nobody reading its mailbox. Answer
++     * each word with the completion event on that SPU port, so a PPU thread that
++     * writes a command and waits for the reply carries on. Opt-in stand-in: SEGA
++     * Rally's MultiStream audio SPU calls into firmware code (flashATRAC.pic) it
++     * loads at run time, which is not lifted, so the audio engine is silent. */
++    if (spu_mb_ack_port() >= 0 && t->sctx && !t->running) {
++        spu_mb_ack_dead(t, (uint32_t)spu_mb_ack_port(), val);
++        ctx->gpr[3] = 0;
++        return 0;
++    }
++
+     /* Preferred path: the worker is alive and blocked in rdch on its own host
+      * thread. Write its mailbox and wake it, so it resumes exactly where it was
+      * with its registers intact. */
+@@ -1800,6 +1836,15 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
+                 spu_id, is_intr, value, q); }
+ }
+ 
++/* See SPU_MB_ACK in sys_spu_thread_write_spu_mb_handler. */
++static void spu_mb_ack_dead(spu_thread_t* t, uint32_t port, uint32_t val)
++{
++    { static int n = 0; if (PS3_LOG_FIRST(n, 16))
++        fprintf(stderr, "[SPU] SPU_MB_ACK: tid=0x%X is not running; word 0x%08X answered "
++                "on port 0x%X\n", t->tid, val, port); }
++    ydkj_spu_out_mbox_deliver(t->group_id, t->tid, 1, ((port & 0xFFu) << 24) | 1u);
++}
++
+ /* SPU virtual local store. Real hardware: 256 KB per SPU. We allocate on
+  * first read/write so the common case (group with no LS access) doesn't
+  * waste 256 KB × num_threads. */
