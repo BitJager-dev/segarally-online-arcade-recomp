@@ -108,6 +108,7 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 
 /* The GCM half of the frame clock. */
 void     cellGcmTickVBlank(void);
+void     cellGcm_fifo_kick_wait(unsigned ms);   /* cellGcmSys.c: idle wait a dry fence wakes */
 void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
@@ -211,8 +212,16 @@ static DWORD WINAPI frame_clock(LPVOID)
     unsigned  last_flip = 0;
     ULONGLONG next_tick = GetTickCount64();
 
+    /* The idle wait between passes. Each pass stops at a guest flip, and the
+     * label the game's main loop waits on is written right behind it, on the
+     * next pass: with a flat 4 ms sleep that was up to 4 ms a frame, more for
+     * every fence it waits on mid-frame, and it held a race on a Phoenix iGPU
+     * below 30 fps with nothing saturated. 1 ms (FRAME_CLOCK_MS), and a game
+     * thread finding the fence queue dry wakes it at once (kick). */
+    static unsigned idle_ms = 0;
+    if (!idle_ms) { const char* e = getenv("FRAME_CLOCK_MS"); idle_ms = e && atoi(e) > 0 ? (unsigned)atoi(e) : 1u; }
     for (;;) {
-        Sleep(4);
+        cellGcm_fifo_kick_wait(idle_ms);
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;
