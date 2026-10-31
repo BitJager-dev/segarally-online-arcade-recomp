@@ -1,5 +1,5 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 298ee7d..299c8ef 100644
+index 298ee7d..6b5c39c 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -135,10 +135,26 @@ static volatile int s_flip_direct_pending = 0;
@@ -31,7 +31,23 @@ index 298ee7d..299c8ef 100644
      if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
      return 0;
  }
-@@ -805,7 +821,9 @@ void cellGcm_request_tick(void)
+@@ -158,6 +174,15 @@ int cellGcm_take_flip_pending(void)
+  * keep presenting display buffer 0 for a title that flips through 0xFEAD. */
+ static void gcm_set_current_display_buffer(u32 bufferId)
+ {
++    /* PS3_FPS=1: flips the GPU executed per second, every 5 s. */
++    { static int on = -1; if (on < 0) on = getenv("PS3_FPS") ? 1 : 0;
++      if (on) { static u64 t0; static unsigned n; const u64 now = get_timestamp_ns();
++        if (!t0) t0 = now;
++        n++;
++        if (now - t0 >= 5000000000ull) {
++            fprintf(stderr, "[fps] %.1f flips/s\n", n * 1e9 / (double)(now - t0));
++            n = 0; t0 = now;
++        } } }
+     s_current_display_buffer_id = bufferId;
+     if (rsx_draw_engine_enabled())
+         rsx_draw_engine_note_flip(bufferId);
+@@ -805,7 +830,9 @@ void cellGcm_request_tick(void)
       * are unaffected. The completion is stamped with the flip requested last
       * (see ppu_gcm_pump). */
      if (gcm_flip_executed_take()) {
@@ -42,7 +58,7 @@ index 298ee7d..299c8ef 100644
          GCM_PENDING_SET(3);
      } else {
          GCM_PENDING_SET(1);
-@@ -899,9 +917,15 @@ void cellGcmTickFlip(void)
+@@ -899,9 +926,15 @@ void cellGcmTickFlip(void)
  {
      /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
       * not happened yet. */
@@ -60,7 +76,7 @@ index 298ee7d..299c8ef 100644
      FLIP_UNLOCK();
      if (waiting) GCM_PENDING_SET(2);
  }
-@@ -1492,6 +1516,9 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
+@@ -1492,6 +1525,9 @@ static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
  static u32 s_tr_off[GCM_TRACE_N], s_tr_w[GCM_TRACE_N];
  static u32 s_cf_off[8], s_cf_w[8], s_cf_i;   /* last JUMP/CALL words, for GCM_CIRCLE_DUMP */
  static u32 s_tr_i = 0;
@@ -70,7 +86,7 @@ index 298ee7d..299c8ef 100644
  
  /* A branch we cannot take leaves the walker pointing at whatever it
   * mis-decoded, and it never recovers -- get freezes for the rest of the
-@@ -1700,6 +1727,11 @@ static void gcm_fifo_dump_around(u32 getoff)
+@@ -1700,6 +1736,11 @@ static void gcm_fifo_dump_around(u32 getoff)
          fprintf(stderr, "[FIFODUMP] %+3d io=%08X w=%08X%s\n",
                  k, io, vm_read32(ea), k ? "" : "   <-- bad word");
      }
@@ -82,7 +98,7 @@ index 298ee7d..299c8ef 100644
  }
  
  
-@@ -1948,6 +1980,7 @@ volatile unsigned long g_gcm_drain_tid;
+@@ -1948,6 +1989,7 @@ volatile unsigned long g_gcm_drain_tid;
  
  void cellGcm_rsx_process_fifo(void)
  {
@@ -90,7 +106,7 @@ index 298ee7d..299c8ef 100644
      wprof_note_walker();
      g_gcm_drain_tid = GetCurrentThreadId();
      const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-@@ -2000,6 +2033,16 @@ static int gcm_word_diag(void)
+@@ -2000,6 +2042,16 @@ static int gcm_word_diag(void)
  
  /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
   * plus the methods whose answer the walker writes itself. */
@@ -107,7 +123,7 @@ index 298ee7d..299c8ef 100644
  static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
  {
      extern u32 g_rsx_last_reference;
-@@ -2020,9 +2063,29 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+@@ -2020,9 +2072,29 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
       * reports "visible" -- the conservative answer; reading 0
       * tells the title every queried object is occluded. */
      if (m == 0x1A8) s_report_dma = v;
@@ -138,7 +154,7 @@ index 298ee7d..299c8ef 100644
          const u64 ts = gcm_report_timestamp();
          const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
          { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
-@@ -2122,6 +2185,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2122,6 +2194,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
      }
  
      u32 start_off = s_fifo_getoff;
@@ -159,7 +175,7 @@ index 298ee7d..299c8ef 100644
      /* GCM_DRAINDBG: log one drain pass in GCM_DRAINDBG_EVERY (default 60). */
      static int s_drain_every = -1;
      if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
-@@ -2165,10 +2242,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2165,10 +2251,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
       * bad branch, which is exactly the case where the drift is silent. */
      { static int snap = -1;
        if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
@@ -177,7 +193,7 @@ index 298ee7d..299c8ef 100644
                u32 gio = s_fifo_getoff + (u32)(k * 4), pio = put + (u32)(k * 4);
                u32 gea = gcm_io2ea(gio), pea = gcm_io2ea(pio);
                fprintf(stderr, "[SNAP]  get+%-3d io=%08X w=%08X   put+%-3d io=%08X w=%08X\n",
-@@ -2398,7 +2479,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2398,7 +2488,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
          }
          if ((w & 3) == 2) {                    /* CALL: offset | 2 */
              { u32 tgt = w & 0x1FFFFFFCu;
@@ -186,7 +202,7 @@ index 298ee7d..299c8ef 100644
                s_fifo_calloff = s_fifo_getoff + 4;
                s_fifo_getoff  = tgt; }
              continue;
-@@ -3171,10 +3252,26 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+@@ -3171,10 +3261,26 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
      const u32 cb_opd = vm_read32(ctx + 0xC);
      const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
@@ -215,10 +231,68 @@ index 298ee7d..299c8ef 100644
      }
      vm_write32(ctx + 8, cur + 4);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff601..e407ae8 100644
+index 8dff601..4f7f225 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1661,6 +1661,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
+@@ -1322,9 +1322,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+  * cache full evicts the least recently used entry rather than returning
+  * nothing: returning white "made the recovered orphanage render as flat
+  * green/black geometry" (rsx_live_draw.c:2326-2334). */
++/* ENG_TEX_STATS=1: every 5 s, texture binds and why any were decoded again. */
++static struct { unsigned binds, miss, evict, changed, rewritten; double bytes; unsigned frame0; double t0; } s_ts;
++static int eng_tex_stats_on(void) { static int on = -1; if (on < 0) on = getenv("ENG_TEX_STATS") ? 1 : 0; return on; }
++static void eng_tex_stats_tick(void)
++{
++    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++    const double now = t.tv_sec + t.tv_nsec / 1e9;
++    if (!s_ts.t0) { s_ts.t0 = now; s_ts.frame0 = g.frames; }
++    if (now - s_ts.t0 < 5) return;
++    const unsigned fr = g.frames - s_ts.frame0 ? g.frames - s_ts.frame0 : 1;
++    fprintf(stderr, "[tex] per frame: %.0f binds, %.1f new, %.1f evicted, %.1f changed, %.1f rewritten, "
++            "%.2f MB decoded (%u cached of %u)\n", s_ts.binds / (double)fr, s_ts.miss / (double)fr,
++            s_ts.evict / (double)fr, s_ts.changed / (double)fr, s_ts.rewritten / (double)fr,
++            s_ts.bytes / fr / 1e6, g.n_textures, (unsigned)ENG_MAX_TEXTURES);
++    memset(&s_ts, 0, sizeof s_ts);
++    s_ts.t0 = now; s_ts.frame0 = g.frames;
++}
++
+ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                             u32 levels, u32 pitch, int cube, u32 remap, u32 depth)
+ {
++    if (eng_tex_stats_on()) { s_ts.binds++; eng_tex_stats_tick(); }
+     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
+     if (!depth) depth = 1;
+     const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
+@@ -1372,6 +1391,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+              * stored hash becomes unknown and the next ordinary check
+              * re-uploads once rather than miss a change. */
+             if (e->rewritten && readable) {
++                if (eng_tex_stats_on()) s_ts.rewritten++;
+                 hash = ~e->content_hash;
+                 e->rewritten = 0;
+             } else if (readable && (sparse != e->sparse_hash ||
+@@ -1382,6 +1402,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+             if (readable) e->sparse_hash = sparse;
+             e->last_hash_frame = g.frames;
+             if (readable && hash != e->content_hash) {
++                if (eng_tex_stats_on()) { s_ts.changed++; s_ts.bytes += span;
++                    static unsigned nl; if (g.frames > 2000 && nl < 24) { nl++;
++                        fprintf(stderr, "[tex] re-decode loc%u off 0x%08X fmt 0x%02X %ux%u lv%u pitch %u depth %u span %u%s\n",
++                                location, offset, fmt, w, h, levels, pitch, depth, span, e->rewritten ? " (rewritten)" : ""); } }
+                 /* In place when the backend orders the upload after the draws
+                  * that sampled the old bytes; a volume keeps create-and-swap,
+                  * and so does a different mip count (the key does not hold it,
+@@ -1412,7 +1436,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+             if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
+                 index = i;
+         evicted = g.textures[index].handle;
++        if (eng_tex_stats_on()) s_ts.evict++;
+     }
++    if (eng_tex_stats_on()) { s_ts.miss++; s_ts.bytes += span; }
+ 
+     eng_texture e;
+     memset(&e, 0, sizeof(e));
+@@ -1661,6 +1687,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
      return mask;
  }
  

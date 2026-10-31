@@ -95,6 +95,9 @@ cd "$ROOT/run"
 # PS3_VERBOSE=1 logs every syscall: gigabytes a minute, and it changes the timing enough to
 # hide or cause hangs. Off by default here.
 # PS3RECOMP_VK_GUEST_PROGRAMS=1: translate the game's own shaders (without it every frame is black).
+# VK_DRAW_BATCH=1: submit up to 512 draws at a time instead of waiting for the GPU after each one
+# (a race frame has ~3600 texture binds; per-draw waits held it at ~9 fps).
+# Diagnostics: PS3_FPS=1 (flips/s), VK_WAIT_STATS=1 (GPU waits per call site), ENG_TEX_STATS=1.
 # PS3RECOMP_VK_WINDOW=1 shows the output when a display is available; every 60th frame is also
 # written to logs/frame.ppm (converted to logs/frame.png below).
 rm -f "$ROOT/logs/frame.ppm" "$ROOT/logs/frame.png"
@@ -107,7 +110,7 @@ FLASH="$DEPS/ps3fw/root/dev_flash"
 [[ -d "$FLASH" ]] && export PS3_DEV_FLASH="${PS3_DEV_FLASH:-$FLASH}"
 PS3RECOMP_VK_GUEST_PROGRAMS="${PS3RECOMP_VK_GUEST_PROGRAMS:-1}" \
 PS3RECOMP_VK_DUMP="$ROOT/logs/frame.ppm" PS3RECOMP_VK_DUMP_EVERY=60 \
-SPU_INTERP_UNLIFTED="${SPU_INTERP_UNLIFTED:-1}" PS3_VERBOSE="${PS3_VERBOSE:-0}" PS3_HDD0_ROOT="$HDD0" PS3_VFS_ROOT="$TITLE" PS3_STDIO_UNBUFFERED=1 \
+SPU_INTERP_UNLIFTED="${SPU_INTERP_UNLIFTED:-1}" VK_DRAW_BATCH="${VK_DRAW_BATCH:-1}" PS3_VERBOSE="${PS3_VERBOSE:-0}" PS3_HDD0_ROOT="$HDD0" PS3_VFS_ROOT="$TITLE" PS3_STDIO_UNBUFFERED=1 \
   timeout -s KILL "$BOOT_SECONDS" "$EXE" "$ROOT/game/EBOOT.elf" > "$ROOT/logs/boot.log" 2>&1
 rc=$?
 echo "exit code: $rc (137 = stopped by the ${BOOT_SECONDS} s timer)"

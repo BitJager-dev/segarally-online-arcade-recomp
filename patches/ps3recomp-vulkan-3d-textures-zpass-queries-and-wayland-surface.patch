@@ -1,5 +1,5 @@
 diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
-index db64302..76c25d8 100644
+index db64302..eb8d674 100644
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
 @@ -101,6 +101,8 @@
@@ -11,7 +11,56 @@ index db64302..76c25d8 100644
      X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
  /* Window-system entry points, loaded only when a window was requested, so a
   * headless run never depends on a driver that can present. */
-@@ -1789,10 +1791,15 @@ static int vk_create_swapchain(void)
+@@ -598,16 +600,47 @@ static int vk_begin(void)
+     return 0;
+ }
+ 
+-static int vk_submit_and_wait(void)
++/* VK_WAIT_STATS=1: every 5 s, the calls and the time spent submitting and
++ * waiting, per call site (source line), busiest first. */
++static int vk_submit_and_wait_line(int line)
+ {
++    static int st = -1;
++    if (st < 0) st = getenv("VK_WAIT_STATS") ? 1 : 0;
++    struct timespec t0, t1;
++    if (st) clock_gettime(CLOCK_MONOTONIC, &t0);
+     VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
+     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
+     VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
+     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
++    if (st) {
++        enum { N = 64 };
++        static int lines[N]; static unsigned calls[N]; static double ms[N]; static double since;
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        const double d = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
++        int k = 0;
++        while (k < N && lines[k] && lines[k] != line) k++;
++        if (k < N) { lines[k] = line; calls[k]++; ms[k] += d; }
++        const double now = t1.tv_sec * 1e3 + t1.tv_nsec / 1e6;
++        if (!since) since = now;
++        if (now - since >= 5000) {
++            fprintf(stderr, "[vk-wait] per 5 s:");
++            for (int r = 0; r < 6; r++) {
++                int b = -1;
++                for (int j = 0; j < N && lines[j]; j++) if (calls[j] && (b < 0 || ms[j] > ms[b])) b = j;
++                if (b < 0) break;
++                fprintf(stderr, " line %d: %u calls %.0f ms;", lines[b], calls[b], ms[b]);
++                calls[b] = 0; ms[b] = 0;
++            }
++            for (int j = 0; j < N; j++) { calls[j] = 0; ms[j] = 0; }
++            fprintf(stderr, "\n");
++            since = now;
++        }
++    }
+     return 0;
+ }
++#define vk_submit_and_wait() vk_submit_and_wait_line(__LINE__)
+ 
+ /* Order this command buffer's use of an image after everything submitted
+  * before it; from UNDEFINED it is also the one-time move to GENERAL. */
+@@ -1789,10 +1822,15 @@ static int vk_create_swapchain(void)
      VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, NULL),
               "vkGetPhysicalDeviceSurfaceFormatsKHR");
      if (nf == 0) { VK_LOG("surface reports no formats\n"); return -1; }
@@ -31,7 +80,7 @@ index db64302..76c25d8 100644
      /* UNORM, not SRGB: the offscreen target holds the guest's values as-is. */
      VkSurfaceFormatKHR fmt = fmts[0];
      if (nf == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
-@@ -1804,6 +1811,7 @@ static int vk_create_swapchain(void)
+@@ -1804,6 +1842,7 @@ static int vk_create_swapchain(void)
              for (u32 i = 0; i < nf; i++)
                  if (fmts[i].format == pref[k]) { fmt = fmts[i]; found = 1; break; }
      }
@@ -39,7 +88,7 @@ index db64302..76c25d8 100644
      VkFormatProperties fp;
      pvkGetPhysicalDeviceFormatProperties(s_vk.phys, fmt.format, &fp);
      if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
-@@ -2090,6 +2098,7 @@ typedef struct vk_eng_obj {
+@@ -2090,6 +2129,7 @@ typedef struct vk_eng_obj {
      u32      block;                  /* bytes per 4x4 block, 0 = not BC     */
      u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
      u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
@@ -47,7 +96,7 @@ index db64302..76c25d8 100644
      u8       snapshot;               /* COLOR: a feedback copy, never a target */
      u32      mips;                   /* TEXTURE: levels the image was created with */
  } vk_eng_obj;
-@@ -2173,15 +2182,15 @@ static vk_buffer* vk_stage_get(vk_buffer* b, VkDeviceSize size, VkBufferUsageFla
+@@ -2173,15 +2213,15 @@ static vk_buffer* vk_stage_get(vk_buffer* b, VkDeviceSize size, VkBufferUsageFla
  
  /* Copy `rows` rows of `w` texels from host memory into a w x h rectangle at
   * (x, y) of one level / layer of an image that is in GENERAL. */
@@ -67,7 +116,7 @@ index db64302..76c25d8 100644
              .imageExtent = { w, h, 1 },
          };
          const int b = vk_eb_upload(img, &region, src, tight, rows, row_bytes);
-@@ -2198,7 +2207,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
+@@ -2198,7 +2238,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
          vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
          VkBufferImageCopy region = {
              .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
@@ -76,7 +125,7 @@ index db64302..76c25d8 100644
              .imageExtent = { w, h, 1 },
          };
          pvkCmdCopyBufferToImage(s_vk.cmd, st->buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-@@ -2207,6 +2216,14 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
+@@ -2207,6 +2247,14 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
      return rc;
  }
  
@@ -91,7 +140,7 @@ index db64302..76c25d8 100644
  /* The same into the whole of a level, from its origin. */
  static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
                                size_t tight, u32 rows, const void* src, u32 row_bytes)
-@@ -2561,6 +2578,68 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
+@@ -2561,6 +2609,68 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
      vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
  }
  
@@ -160,7 +209,7 @@ index db64302..76c25d8 100644
  /* A colour target sampled with a unit's crossbar: an extra view of the same
   * image, cached by (surface, crossbar, format) and released with the target. */
  static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
-@@ -2820,6 +2899,7 @@ typedef struct vk_eng_pipe {
+@@ -2820,6 +2930,7 @@ typedef struct vk_eng_pipe {
      u32                 nslots, stride, rt_count;
      VkFormat            rt_fmt;          /* picks the render pass it is built against */
      u32                 cube_mask;       /* TextureCube units: the split set layout */
@@ -168,7 +217,7 @@ index db64302..76c25d8 100644
      VkPipeline          variant[VK_ENG_TOPOLOGIES];
  } vk_eng_pipe;
  
-@@ -2852,6 +2932,7 @@ static struct {
+@@ -2852,6 +2963,7 @@ static struct {
      VkDescriptorSet       split_set;
      VkPipelineLayout      split_pipe_layout;
      u32                   dummy_cube;
@@ -176,7 +225,7 @@ index db64302..76c25d8 100644
  } s_e2;
  
  #define VK_ENG_SAMP_CACHE 64
-@@ -3027,6 +3108,19 @@ static u32 vk_eng_cube_units(const char* ps_hlsl)
+@@ -3027,6 +3139,19 @@ static u32 vk_eng_cube_units(const char* ps_hlsl)
      return mask;
  }
  
@@ -196,7 +245,7 @@ index db64302..76c25d8 100644
  static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                    const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                    u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
-@@ -3063,6 +3157,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
+@@ -3063,6 +3188,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
      P->rt_count = rt_count;
      P->rt_fmt = cf;
      P->cube_mask = vk_eng_cube_units(ps_hlsl);
@@ -204,7 +253,7 @@ index db64302..76c25d8 100644
      P->used = 1;
      return slot + 1u;
  }
-@@ -3090,7 +3185,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+@@ -3090,7 +3216,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
      if (P->variant[topo_idx]) return P->variant[topo_idx];
      VkRenderPass rp = vk_eng_render_pass(P->rt_fmt, P->rt_count);
      if (!rp || P->nslots > VK_GUEST_ATTRS) return VK_NULL_HANDLE;
@@ -213,7 +262,7 @@ index db64302..76c25d8 100644
      if (!layout) return VK_NULL_HANDLE;
      const rsx_be_render_state* rs = &P->rs;
  
-@@ -3395,13 +3490,27 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
+@@ -3395,13 +3521,27 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
   * A unit gets a view of its own kind only -- a cube for a TextureCube unit, a
   * 2D one otherwise -- and NULL for anything else, which then samples the
   * dummy of the unit's kind. */
@@ -243,7 +292,7 @@ index db64302..76c25d8 100644
  }
  
  /* What a cube unit with nothing bound samples: a 1x1 cube, magenta on every
-@@ -3532,6 +3641,75 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
+@@ -3532,6 +3672,75 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
      return 0;
  }
  
@@ -319,7 +368,7 @@ index db64302..76c25d8 100644
  static void vk_eng_flush(void)
  {
      if (!s_eb_pending) return;
-@@ -3559,29 +3737,32 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
+@@ -3559,29 +3768,32 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
   * per unit). Returns the set, or VK_NULL_HANDLE. */
  static VkDescriptorSet vk_eng_write_descriptors(const vk_eng_pipe* P)
  {
@@ -359,7 +408,7 @@ index db64302..76c25d8 100644
                                           VK_IMAGE_LAYOUT_GENERAL };
          si[u] = (VkDescriptorImageInfo){ smp, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
      }
-@@ -3610,6 +3791,7 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
+@@ -3610,6 +3822,7 @@ static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescr
      return set;
  }
  
@@ -367,7 +416,7 @@ index db64302..76c25d8 100644
  static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                          u32 stride, const u32* indices, u32 index_count)
  {
-@@ -3618,6 +3800,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3618,6 +3831,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
      vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
      if (!P->used || stride != P->stride) return;
@@ -377,7 +426,7 @@ index db64302..76c25d8 100644
  
      /* Targets: every member of a set is target A's size (engine contract). */
      const u32 n = s_eng_bound.nrt;
-@@ -3652,6 +3837,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3652,6 +3868,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
      int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES && ibytes <= VK_EB_IB_BYTES;
      if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
@@ -385,7 +434,7 @@ index db64302..76c25d8 100644
      if (batched) {
          /* Slices of the rings and a set from the pool; a full one flushes the
           * batch (which empties them all) and the draw takes its slices again. */
-@@ -3663,7 +3849,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3663,7 +3880,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
              const VkDeviceSize ups = uvs == (VkDeviceSize)-1 ? uvs : vk_eb_take(&uh, VK_EB_UB_BYTES, psb, s_eb.ub_align);
              if (voff != (VkDeviceSize)-1 && ioff != (VkDeviceSize)-1 && ups != (VkDeviceSize)-1 &&
                  s_eb.sets < VK_EB_MAX_SETS) {
@@ -394,7 +443,7 @@ index db64302..76c25d8 100644
                  VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                                      .descriptorPool = s_eb.pool, .descriptorSetCount = 1,
                                                      .pSetLayouts = &lay };
-@@ -3713,6 +3899,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3713,6 +3930,10 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                    .renderPass = rp, .framebuffer = fb,
                                    .renderArea = { { 0, 0 }, { w, h } } };
@@ -405,7 +454,7 @@ index db64302..76c25d8 100644
      pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
      pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
      VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
-@@ -3734,15 +3924,17 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3734,15 +3955,17 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
      if (s_vk.depth_bounds_ok)
          pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
      pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -424,7 +473,7 @@ index db64302..76c25d8 100644
      pvkCmdEndRenderPass(s_vk.cmd);
      if (!batched) { vk_submit_and_wait(); return; }
      s_eb.draws++;
-@@ -3756,6 +3948,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -3756,6 +3979,8 @@ static const rsx_draw_backend s_vk_engine_backend = {
      .submit_and_wait      = vk_eng_submit_and_wait,
      .texture_create       = vk_eng_texture_create,
      .texture_upload       = vk_eng_texture_upload,
@@ -433,7 +482,7 @@ index db64302..76c25d8 100644
      .texture_release      = vk_eng_release,
      .color_target_create  = vk_eng_color_target_create,
      .color_target_release = vk_eng_release,
-@@ -3875,6 +4069,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+@@ -3875,6 +4100,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
       * have their own); without it every target takes target A's. */
      want.independentBlend = have.independentBlend;
      s_vk.indep_blend_ok = have.independentBlend ? 1 : 0;
