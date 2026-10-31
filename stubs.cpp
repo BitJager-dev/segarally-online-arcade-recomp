@@ -48,11 +48,17 @@ static int32_t sr_cellSpursGetSpuThreadId(uint32_t spurs, uint32_t thread, uint3
     return CELL_OK;
 }
 
+/* cellL10n's UTF8stoUCS2s (NID 0xFDBF6AC5) is implemented in libs/font/cellL10n.c, but
+ * gen_hle_nids.py only registers functions named cell*, sce* or sys*, so the cellL10n
+ * converters never reach the table. Register this one by hand. */
+extern "C" s32 UTF8stoUCS2s(u32 src_ea, u32 src_len_ea, u32 dst_ea, u32 dst_len_ea);
+
 /* Runs before ppu_hle_init(); the generated table has no entry for these NIDs, so
  * registering them first does not collide with anything. */
 extern "C" void ps3_load_prx_modules(void)
 {
     ps3_hle_register(0x6C960F6Du, "cellSpursGetSpuThreadId", (void*)sr_cellSpursGetSpuThreadId);
+    ps3_hle_register(0xFDBF6AC5u, "UTF8stoUCS2s", (void*)UTF8stoUCS2s);
 }
 
 /* ---------------------------------------------------------------------------

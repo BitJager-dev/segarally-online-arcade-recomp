@@ -1,0 +1,319 @@
+diff --git a/libs/font/cellL10n.c b/libs/font/cellL10n.c
+index d1b4b1e..42d8466 100644
+--- a/libs/font/cellL10n.c
++++ b/libs/font/cellL10n.c
+@@ -10,6 +10,7 @@
+ #include "cellL10n.h"
+ #include <stdio.h>
+ #include <string.h>
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read32/vm_write: guest EA -> host */
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal UTF helpers
+@@ -551,3 +552,32 @@ s32 l10n_convert_str(s32 src_code, const void* src, u32* src_len,
+                           (u32)dst_code, dst, out_len, dst_len);
+     return rc;
+ }
++
++/* ---------------------------------------------------------------------------
++ * UTF8stoUCS2s
++ * -----------------------------------------------------------------------*/
++
++enum { L10N_CONVERSION_OK = 0, L10N_SRC_ILLEGAL = 1, L10N_DST_EXHAUSTED = 2 };
++
++s32 UTF8stoUCS2s(u32 src_ea, u32 src_len_ea, u32 dst_ea, u32 dst_len_ea)
++{
++    if (!src_ea || !src_len_ea || !dst_len_ea)
++        return L10N_SRC_ILLEGAL;
++    const u32 len = vm_read32(src_len_ea);
++    const u32 out_max = dst_ea ? vm_read32(dst_len_ea) : 0xFFFFFFFFu;
++    const u8* src = vm_base + src_ea;
++    u32 in_pos = 0, out_pos = 0;
++    s32 rc = L10N_CONVERSION_OK;
++
++    while (in_pos < len) {
++        u32 cp;
++        const int consumed = decode_utf8(src + in_pos, len - in_pos, &cp);
++        if (consumed == 0 || cp > 0xFFFF) { rc = L10N_SRC_ILLEGAL; break; }
++        if (out_pos >= out_max) { rc = L10N_DST_EXHAUSTED; break; }
++        if (dst_ea) vm_write16(dst_ea + out_pos * 2, (u16)cp);
++        out_pos++;
++        in_pos += (u32)consumed;
++    }
++    vm_write32(dst_len_ea, out_pos);
++    return rc;
++}
+diff --git a/libs/font/cellL10n.h b/libs/font/cellL10n.h
+index 7ac5aac..071e751 100644
+--- a/libs/font/cellL10n.h
++++ b/libs/font/cellL10n.h
+@@ -92,6 +92,10 @@ s32 UTF8stoUTF16s(const u8* utf8, u32* utf8_len,
+                   u16* utf16, u32* utf16_len);
+ s32 UTF16stoUTF8s(const u16* utf16, u32* utf16_len,
+                   u8* utf8, u32* utf8_len);
++/* Guest-memory form (the arguments are guest EAs, lengths big-endian s32): converts
++ * *src_len bytes (src_len is not written back), returns L10N_CONVERSION_OK / L10N_SRC_ILLEGAL / L10N_DST_EXHAUSTED
++ * like the firmware; with dst == 0 it only counts the output units. */
++s32 UTF8stoUCS2s(u32 src_ea, u32 src_len_ea, u32 dst_ea, u32 dst_len_ea);
+ 
+ /* ---------------------------------------------------------------------------
+  * Utility
+diff --git a/libs/hardware/cellUsbd.c b/libs/hardware/cellUsbd.c
+index c359680..9e6e012 100644
+--- a/libs/hardware/cellUsbd.c
++++ b/libs/hardware/cellUsbd.c
+@@ -66,6 +66,22 @@ s32 cellUsbdUnregisterLdd(const CellUsbdLddOps* ops)
+     return CELL_OK;
+ }
+ 
++s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops, u16 vendor_id, u16 product_id_min, u16 product_id_max)
++{
++    printf("[cellUsbd] RegisterExtraLdd2(vid=%04X pid=%04X-%04X)\n", vendor_id, product_id_min, product_id_max);
++    return cellUsbdRegisterLdd(ops);
++}
++
++s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops, u16 vendor_id, u16 product_id)
++{
++    return cellUsbdRegisterExtraLdd2(ops, vendor_id, product_id, product_id);
++}
++
++s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops)
++{
++    return cellUsbdUnregisterLdd(ops);
++}
++
+ s32 cellUsbdGetDeviceList(CellUsbdDeviceInfo* list, u32 maxDevices,
+                             u32* numDevices)
+ {
+diff --git a/libs/hardware/cellUsbd.h b/libs/hardware/cellUsbd.h
+index 6d8dd23..e4fb46d 100644
+--- a/libs/hardware/cellUsbd.h
++++ b/libs/hardware/cellUsbd.h
+@@ -61,6 +61,11 @@ s32 cellUsbdEnd(void);
+ 
+ s32 cellUsbdRegisterLdd(const CellUsbdLddOps* ops);
+ s32 cellUsbdUnregisterLdd(const CellUsbdLddOps* ops);
++/* Extra LDDs: a driver for one vendor id and a range of product ids. No device is ever
++ * attached, so its probe callback is never called; registering only has to succeed. */
++s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops, u16 vendor_id, u16 product_id);
++s32 cellUsbdRegisterExtraLdd2(const CellUsbdLddOps* ops, u16 vendor_id, u16 product_id_min, u16 product_id_max);
++s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops);
+ 
+ s32 cellUsbdGetDeviceList(CellUsbdDeviceInfo* list, u32 maxDevices,
+                             u32* numDevices);
+diff --git a/libs/network/sceNp.c b/libs/network/sceNp.c
+index 125835bc..cd2f78b 100644
+--- a/libs/network/sceNp.c
++++ b/libs/network/sceNp.c
+@@ -417,3 +417,23 @@ s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path)
+ {
+     return np_drm_is_available(k_licensee, drm_path);
+ }
++
++s32 sceNpCustomMenuRegisterActions(u32 menu_ea, u32 handler, u32 user_arg, u64 options)
++{
++    (void)handler; (void)user_arg; (void)options;
++    if (!s_np_initialized)
++        return SCE_NP_ERROR_NOT_INITIALIZED;
++    if (!menu_ea)
++        return SCE_NP_ERROR_INVALID_ARGUMENT;
++    return CELL_OK;
++}
++
++s32 sceNpCustomMenuActionSetActivation(u32 index_array_ea, u64 options)
++{
++    (void)options;
++    if (!s_np_initialized)
++        return SCE_NP_ERROR_NOT_INITIALIZED;
++    if (!index_array_ea)
++        return SCE_NP_ERROR_INVALID_ARGUMENT;
++    return CELL_OK;
++}
+diff --git a/libs/network/sceNp.h b/libs/network/sceNp.h
+index 5efd6f6..c5f735a 100644
+--- a/libs/network/sceNp.h
++++ b/libs/network/sceNp.h
+@@ -155,6 +155,11 @@ s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
+ /* Set the fake PSN username (call before sceNpInit if desired) */
+ void sceNpSetFakeUsername(const char* username);
+ 
++/* Custom XMB menu actions (the in-game "Online" menu entries). There is no system
++ * menu to show them in, so registering only has to succeed; the handler never fires. */
++s32 sceNpCustomMenuRegisterActions(u32 menu_ea, u32 handler, u32 user_arg, u64 options);
++s32 sceNpCustomMenuActionSetActivation(u32 index_array_ea, u64 options);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/system/sysPrxForUser.c b/libs/system/sysPrxForUser.c
+index b2cba7b..0ea7bb1 100644
+--- a/libs/system/sysPrxForUser.c
++++ b/libs/system/sysPrxForUser.c
+@@ -1155,3 +1155,145 @@ s32 sys_process_get_paramsfo(void* buf)
+     memset(yz_g2h(buf), 0, 256);
+     return CELL_OK;
+ }
++
++/* ---------------------------------------------------------------------------
++ * Memory pools
++ *
++ * A pool splits a guest chunk into chunk_size / block_size blocks and hands
++ * them out last-freed-first, like the firmware (a vector of free blocks).
++ * The pool id written to *mempool is a slot index + 1, so 0 stays invalid.
++ * -----------------------------------------------------------------------*/
++
++#define MAX_MEMPOOL 32
++
++typedef struct {
++    int in_use;
++    u32 chunk, chunk_size, block_size;
++    u32 nfree, cap;
++    u32* free_blocks;          /* guest EAs */
++#ifdef _WIN32
++    SRWLOCK lock;
++    CONDITION_VARIABLE cond;
++#else
++    pthread_mutex_t lock;
++    pthread_cond_t cond;
++#endif
++} MemPoolSlot;
++
++static MemPoolSlot s_mempool[MAX_MEMPOOL];
++
++#ifdef _WIN32
++static void mp_lock(MemPoolSlot* p)   { AcquireSRWLockExclusive(&p->lock); }
++static void mp_unlock(MemPoolSlot* p) { ReleaseSRWLockExclusive(&p->lock); }
++static void mp_wait(MemPoolSlot* p)   { SleepConditionVariableSRW(&p->cond, &p->lock, INFINITE, 0); }
++static void mp_signal(MemPoolSlot* p) { WakeConditionVariable(&p->cond); }
++#else
++static void mp_lock(MemPoolSlot* p)   { pthread_mutex_lock(&p->lock); }
++static void mp_unlock(MemPoolSlot* p) { pthread_mutex_unlock(&p->lock); }
++static void mp_wait(MemPoolSlot* p)   { pthread_cond_wait(&p->cond, &p->lock); }
++static void mp_signal(MemPoolSlot* p) { pthread_cond_signal(&p->cond); }
++#endif
++
++static MemPoolSlot* mp_get(u32 id)
++{
++    if (id == 0 || id > MAX_MEMPOOL || !s_mempool[id - 1].in_use) return NULL;
++    return &s_mempool[id - 1];
++}
++
++s32 sys_mempool_create(u32 mempool_ea, u32 chunk_ea, u64 chunk_size, u64 block_size, u64 ralignment)
++{
++    u64 align = (ralignment == 0 || ralignment == 2) ? 4 : ralignment;
++    if (!mempool_ea || block_size == 0 || block_size > chunk_size || chunk_size > 0xFFFFFFFFull)
++        return (s32)CELL_EINVAL;
++    if ((align & (align - 1)) != 0 || (chunk_ea & 7) != 0)
++        return (s32)CELL_EINVAL;
++
++    const u32 n = (u32)(chunk_size / block_size);
++    u32* blocks = (u32*)malloc((n ? n : 1) * sizeof(u32));
++    if (!blocks) return (s32)CELL_ENOMEM;
++
++    slot_lock();
++    u32 i = 0;
++    while (i < MAX_MEMPOOL && s_mempool[i].in_use) i++;
++    if (i == MAX_MEMPOOL) { slot_unlock(); free(blocks); return (s32)CELL_EAGAIN; }
++    MemPoolSlot* p = &s_mempool[i];
++    p->in_use = 1;
++    slot_unlock();
++
++    p->chunk = chunk_ea;
++    p->chunk_size = (u32)chunk_size;
++    p->block_size = (u32)block_size;
++    p->free_blocks = blocks;
++    p->cap = p->nfree = n;
++    for (u32 b = 0; b < n; b++) blocks[b] = chunk_ea + b * (u32)block_size;
++#ifdef _WIN32
++    InitializeSRWLock(&p->lock);
++    InitializeConditionVariable(&p->cond);
++#else
++    pthread_mutex_init(&p->lock, NULL);
++    pthread_cond_init(&p->cond, NULL);
++#endif
++    vm_write32(mempool_ea, i + 1);
++    printf("[sysPrxForUser] mempool_create id=%u chunk=0x%08X size=0x%X block=0x%X -> %u blocks\n",
++           i + 1, chunk_ea, (u32)chunk_size, (u32)block_size, n);
++    return CELL_OK;
++}
++
++void sys_mempool_destroy(u32 mempool)
++{
++    MemPoolSlot* p = mp_get(mempool);
++    if (!p) return;
++    free(p->free_blocks);
++    p->free_blocks = NULL;
++    p->nfree = p->cap = 0;
++#ifndef _WIN32
++    pthread_cond_destroy(&p->cond);
++    pthread_mutex_destroy(&p->lock);
++#endif
++    slot_lock();
++    p->in_use = 0;
++    slot_unlock();
++}
++
++s32 sys_mempool_free_block(u32 mempool, u32 block_ea)
++{
++    MemPoolSlot* p = mp_get(mempool);
++    if (!p) return (s32)CELL_EINVAL;
++    if (block_ea < p->chunk || block_ea >= p->chunk + p->chunk_size) return (s32)CELL_EINVAL;
++    mp_lock(p);
++    if (p->nfree < p->cap) p->free_blocks[p->nfree++] = block_ea;
++    mp_signal(p);
++    mp_unlock(p);
++    return CELL_OK;
++}
++
++u32 sys_mempool_try_allocate_block(u32 mempool)
++{
++    MemPoolSlot* p = mp_get(mempool);
++    if (!p) return 0;
++    mp_lock(p);
++    const u32 b = p->nfree ? p->free_blocks[--p->nfree] : 0;
++    mp_unlock(p);
++    return b;
++}
++
++u32 sys_mempool_allocate_block(u32 mempool)
++{
++    MemPoolSlot* p = mp_get(mempool);
++    if (!p) return 0;
++    mp_lock(p);
++    while (p->nfree == 0) mp_wait(p);
++    const u32 b = p->free_blocks[--p->nfree];
++    mp_unlock(p);
++    return b;
++}
++
++u64 sys_mempool_get_count(u32 mempool)
++{
++    MemPoolSlot* p = mp_get(mempool);
++    if (!p) return (u64)(s64)(s32)CELL_EINVAL;
++    mp_lock(p);
++    const u64 n = p->nfree;
++    mp_unlock(p);
++    return n;
++}
+diff --git a/libs/system/sysPrxForUser.h b/libs/system/sysPrxForUser.h
+index 30290c7..6d07a5c 100644
+--- a/libs/system/sysPrxForUser.h
++++ b/libs/system/sysPrxForUser.h
+@@ -190,6 +190,17 @@ s32 console_write(const void* buf, u32 len);
+ 
+ s32 sys_process_get_paramsfo(void* buf);
+ 
++/* ---------------------------------------------------------------------------
++ * Memory pools: fixed-size blocks carved out of a guest chunk
++ * -----------------------------------------------------------------------*/
++
++s32 sys_mempool_create(u32 mempool_ea, u32 chunk_ea, u64 chunk_size, u64 block_size, u64 ralignment);
++void sys_mempool_destroy(u32 mempool);
++s32 sys_mempool_free_block(u32 mempool, u32 block_ea);
++u32 sys_mempool_try_allocate_block(u32 mempool);
++u32 sys_mempool_allocate_block(u32 mempool);
++u64 sys_mempool_get_count(u32 mempool);
++
+ #ifdef __cplusplus
+ }
+ #endif

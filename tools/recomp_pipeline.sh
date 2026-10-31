@@ -26,10 +26,12 @@ $py "$t/find_functions.py" "$elf" --seed-json analysis/EBOOT.functions.json \
     --output analysis/functions.json
 $py "$t/extract_spu_images.py" "$elf" --output analysis/spu_programs/
 
-# Phase 5: PPU -> C++, HLE import stubs, HLE handler table
+# Phase 5: PPU -> C++, HLE import stubs. The HLE handler table is not written here: CMake
+# generates it in the build tree from ps3recomp's libs/ and regenerates it when they change
+# (a generated/ppu_hle_nids.cpp would override that and go stale with every new handler).
 $py "$t/ppu_lifter.py" "$elf" --functions analysis/EBOOT.functions.json \
     --hle-stubs analysis/EBOOT.imports.json --output generated/
-$py "$t/gen_hle_nids.py" --all --out generated/ppu_hle_nids.cpp
+rm -f generated/ppu_hle_nids.cpp
 
 echo "functions: $(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' analysis/EBOOT.functions.json)"
 ls generated | wc -l
