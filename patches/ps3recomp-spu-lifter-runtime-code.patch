@@ -1,0 +1,166 @@
+diff --git a/cmake/PS3RecompSPU.cmake b/cmake/PS3RecompSPU.cmake
+index 5b8a4d5..4ee98e1 100644
+--- a/cmake/PS3RecompSPU.cmake
++++ b/cmake/PS3RecompSPU.cmake
+@@ -11,6 +11,11 @@ function(ps3recomp_generate_spu output_dir)
+     if(PS3RECOMP_SPU_MERGE_CHUNKS)
+         list(APPEND command --merge-chunks)
+     endif()
++    # PS3RECOMP_SPU_RUNTIME_CODE: content names (spu_<sha256>) of programs to lift
++    # with data in their code range and calls into code they load at run time.
++    foreach(name IN LISTS PS3RECOMP_SPU_RUNTIME_CODE)
++        list(APPEND command --runtime-code "${name}")
++    endforeach()
+     foreach(input IN LISTS ARGN)
+         get_filename_component(input "${input}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+         list(APPEND command --input "${input}")
+diff --git a/tools/build_spu_workloads.py b/tools/build_spu_workloads.py
+index 2eef378..548e148 100644
+--- a/tools/build_spu_workloads.py
++++ b/tools/build_spu_workloads.py
+@@ -127,6 +127,11 @@ def main():
+                     help="do not run the lifter; assume --lifted already populated (still fixes includes + emits registry)")
+     ap.add_argument("--allow-partial", action="store_true",
+                     help="With --input, emit supported registrations despite incomplete coverage")
++    ap.add_argument("--runtime-code", action="append", default=[], metavar="NAME",
++                    help="Discovered program (content name, spu_<sha256>) whose code range "
++                         "holds data and that calls code it loads at run time: lift it "
++                         "anyway, leaving the undecodable words as traps and dispatching "
++                         "branches out of the image at run time. Repeatable.")
+     ap.add_argument("--merge-chunks", action="store_true",
+                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks from one "
+                          "call target to the next becomes one C function, so branches "
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index 35d8d42..dc6c87d 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -504,6 +504,14 @@ class SPULifter:
+         self.call_targets: set[int] = set()
+         self.branch_targets: set[int] = set()
+         self.unsupported: dict[str, int] = {}
++        # [lo, hi) of the image's own code. A direct branch or call outside it
++        # targets code the program loads at run time (SEGA Rally's MultiStream
++        # calls into flashATRAC.pic, DMA'd into its bss); there is no lifted
++        # function to call, so dispatch it like an indirect branch: a lifted
++        # overlay registered there runs, anything else is interpreted.
++        self.code_lo: int | None = None
++        self.code_hi: int | None = None
++        self.external_targets: set[int] = set()
+         self.trace = trace
+         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
+         # Lets multiple lifted SPU images link into one binary without collisions
+@@ -921,6 +929,16 @@ class SPULifter:
+             # Treat it as: set the link, then fall through to addr+4.
+             if tgt == addr + 4:
+                 return f"{link} {self._uncond_branch(addr + 4, func)}"
++            if self._external(tgt):
++                # drain_ret_pc = the return address while the dispatcher runs
++                # the target: an interpreted callee stops there (rejoining this
++                # frame) instead of running on through our own code.
++                return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; "
++                        f"const uint32_t _odr = ctx->drain_ret_pc; ctx->drain_ret_pc = 0x{addr + 4:X}; "
++                        f"ctx->pc = 0x{tgt:X}; ctx->host_depth++; "
++                        f"spu_indirect_branch(ctx); ctx->drain_ret_pc = _odr; "
++                        f"spu_drain_call(ctx, 0x{addr + 4:X}); "
++                        f"ctx->host_depth--; spu_img_restore(ctx, _si); }}")
+             if tgt is not None:
+                 self.call_targets.add(tgt)
+                 # Nested host call bracketed by host_depth (so the callee's
+@@ -939,6 +957,9 @@ class SPULifter:
+                         f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
+             if func.start_addr <= tgt < func.end_addr:
+                 return f"if ({cond}) goto loc_{tgt:08X};"
++            if self._external(tgt):
++                return (f"if ({cond}) {{ ctx->pc = 0x{tgt:X}; "
++                        f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
+             self.branch_targets.add(tgt)
+             # Cross-function conditional branch = conditional tail: a direct
+             # tail call when the drain has nothing to do on this step, else
+@@ -1047,11 +1068,21 @@ class SPULifter:
+         }
+         return table.get(mn, f"{word} != 0")
+ 
++    def _external(self, tgt) -> bool:
++        if self.code_lo is None or tgt is None:
++            return False
++        if self.code_lo <= tgt < self.code_hi:
++            return False
++        self.external_targets.add(tgt)
++        return True
++
+     def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
+         if tgt is None:
+             return "/* TODO spu: unresolved branch */;"
+         if func.start_addr <= tgt < func.end_addr:
+             return f"goto loc_{tgt:08X};"
++        if self._external(tgt):
++            return (f"ctx->pc = 0x{tgt:X}; g_spu_trampoline_fn = spu_indirect_branch; return;")
+         self.branch_targets.add(tgt)
+         # Cross-function unconditional tail: a direct tail call when the
+         # drain has nothing to do on this step, else hand the target to the
+@@ -1169,6 +1200,10 @@ def main() -> None:
+                         "to that return address. Splits existing functions only "
+                         "(never seeds a gap), and the splits do not start new "
+                         "--merge-chunks groups, so straight-line speed is kept.")
++    p.add_argument("--external-calls", action="store_true",
++                   help="Dispatch a direct branch/call whose target lies outside "
++                        "this image's code (code loaded at run time) through "
++                        "spu_indirect_branch instead of a lifted function.")
+     p.add_argument("--code-end", type=lambda x: int(x, 0), default=0,
+                    help="Address where executable code ends and an embedded "
+                         "rodata/const tail begins. Drops any auto-detected "
+@@ -1311,6 +1346,8 @@ def main() -> None:
+     insns = disassemble_spu(data, base)
+ 
+     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
++    if args.external_calls:
++        lifter.code_lo, lifter.code_hi = base, base + len(data)
+     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
+     if lifter.bi_r0_jump:
+         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
+@@ -1357,7 +1394,8 @@ def main() -> None:
+             json.dump({"functions": [[f.start_addr, f.end_addr] for f in lifter.functions],
+                        "unsupported": lifter.unsupported,
+                        "call_targets": sorted(lifter.call_targets),
+-                       "branch_targets": sorted(lifter.branch_targets)}, report, indent=2)
++                       "branch_targets": sorted(lifter.branch_targets),
++                       "external_targets": sorted(lifter.external_targets)}, report, indent=2)
+ 
+     print(f"Wrote {hp}")
+     print(f"Wrote {sp}")
+diff --git a/tools/spu_program_pipeline.py b/tools/spu_program_pipeline.py
+index 36cbc24..fd1cc15 100644
+--- a/tools/spu_program_pipeline.py
++++ b/tools/spu_program_pipeline.py
+@@ -197,13 +197,18 @@ def build_programs(args, registry_writer):
+                     command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
+                 if getattr(args, 'merge_chunks', False):
+                     command += ['--merge-chunks']
++                runtime_code = name in (getattr(args, 'runtime_code', None) or [])
++                if runtime_code:
++                    command += ['--external-calls']
+                 result = subprocess.run(command, capture_output=True, text=True)
+                 (outdir / 'lift.log').write_text(result.stdout + result.stderr)
+                 if result.returncode:
+                     raise ValueError('lifter failed; see ' + name + '/lift.log')
+                 diagnostics = json.loads((outdir / 'lift.json').read_text())
+                 program['diagnostics'] = diagnostics
+-                if diagnostics['unsupported']:
++                # --runtime-code: undecodable words are data inside the code range
++                # (never executed; each is a spu_unsupported trap if it were).
++                if set(diagnostics['unsupported']) - ({'.word'} if runtime_code else set()):
+                     raise ValueError('unsupported instructions emitted by lifter')
+                 starts = {s for s, _ in diagnostics['functions']}
+                 if info['entry'] not in starts:
+@@ -217,7 +222,10 @@ def build_programs(args, registry_writer):
+                         raise ValueError('lifter output missing ' + filename)
+                     debase_includes(str(outdir / filename))
+                 expected = f"{prefix}spu_func_{info['entry']:08X}("
+-                if '/* TODO spu:' in (outdir / 'spu_recomp.c').read_text():
++                todo = (outdir / 'spu_recomp.c').read_text().count('/* TODO spu:')
++                if runtime_code:
++                    todo -= (outdir / 'spu_recomp.c').read_text().count('/* TODO spu: .word ')
++                if todo:
+                     raise ValueError('unresolved instruction or branch emitted by lifter')
+                 if expected not in (outdir / 'spu_recomp.h').read_text():
+                     raise ValueError('generated header is missing entry symbol')

@@ -1,0 +1,218 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 5fc5020..abff458 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -577,6 +577,38 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
+ #define SPU_JOB_RETURN_LS   0x3FF00u
+ 
+ /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
++/* An SPU job worker that polls a line with GETLLAR and finds it unchanged is
++ * idle. On the PS3 that spin costs nothing but the SPU; here each SPU is a host
++ * thread, and SEGA Rally's four job workers (no blocking wait anywhere in
++ * their program) kept four host cores at 100% the whole game. After
++ * SPU_POLL_SPIN (default 200) unchanged reads of the same line in a row the
++ * thread sleeps ~20 us (about 70 us with Linux timer slack) per poll, which
++ * caps an idle worker at a few percent of a core and delays picking up new
++ * work by well under a frame. Yielding instead is not enough: two of the four
++ * poll a line that changes every few ms, and a yield on an idle core returns
++ * at once. A change in the line, or a different line, resets it.
++ * SPU_POLL_SPIN=0 turns it off. Called after the lock-line lock is dropped. */
++static void spu_poll_backoff(uint32_t ea, const uint8_t* line)
++{
++    static int s_spin = -1;
++    if (s_spin < 0) { const char* e = getenv("SPU_POLL_SPIN"); s_spin = e ? atoi(e) : 200; }
++    if (s_spin <= 0) return;
++    static SPU_THREAD_LOCAL uint32_t t_ea = 1, t_n;   /* 1: no line is ever unaligned */
++    static SPU_THREAD_LOCAL uint8_t t_line[MFC_ATOMIC_LINE];
++    if (ea != t_ea || memcmp(t_line, line, MFC_ATOMIC_LINE) != 0) {
++        t_ea = ea; t_n = 0;
++        memcpy(t_line, line, MFC_ATOMIC_LINE);
++        return;
++    }
++    if (++t_n < (uint32_t)s_spin) return;
++#ifdef _WIN32
++    Sleep(0);
++#else
++    const struct timespec ts = { 0, 20000 };
++    nanosleep(&ts, NULL);
++#endif
++}
++
+ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+ {
+     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
+@@ -775,6 +807,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+           } }
+         if (!llar_fast) spu_lockline_unlock();
++        spu_poll_backoff(ea, ls);
+         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
+          * used and the first word as it lands in BOTH places.
+          *
+@@ -1715,6 +1748,8 @@ int spu_have_function(uint32_t addr)
+  * through would execute stale code registered under another image. Task and
+  * unbounded overlay misses retain their existing primary-image fallback. */
+ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
++static int s_ovl_static_count;
++static int spu_overlay_static_adopt(spu_context* ctx, uint32_t lsa);
+ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
+ {
+     /* Every probe below goes through #436's per-thread memo rather than
+@@ -1736,6 +1771,10 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+     if (ctx->resident_task) fn = spu_lookup_memoized(lsa, ctx->resident_task);
+     if (!fn && ctx->resident_ovl) fn = spu_lookup_memoized(lsa, ctx->resident_ovl);
+     if (!fn) fn = spu_lookup_memoized(lsa, ctx->image_id);
++    if (!fn && s_ovl_static_count && ctx->image_id > 0) {
++        const int img = spu_overlay_static_adopt((spu_context*)ctx, lsa);
++        if (img) fn = spu_lookup_memoized(lsa, img);
++    }
+     return (spu_lifted_fn)fn;
+ }
+ 
+@@ -1942,6 +1981,93 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+     return 1;
+ }
+ 
++#define SPU_OVL_STATIC_MAX 16
++static struct {
++    int owner, image_id;
++    uint32_t lsa, span;
++    const spu_overlay_code_segment* code;
++    unsigned count;
++} s_ovl_static[SPU_OVL_STATIC_MAX];
++
++int spu_overlay_register_static(int owner_image_id, uint32_t load_lsa, uint32_t span,
++    int image_id, const spu_overlay_code_segment* code, unsigned count)
++{
++    if (!span || load_lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - load_lsa || image_id <= 0 ||
++        owner_image_id <= 0 || !code || !count || s_ovl_static_count >= SPU_OVL_STATIC_MAX)
++        return 0;
++    size_t total = 0;
++    for (unsigned i = 0; i < count; ++i) {
++        if (!code[i].bytes || !code[i].size || code[i].lsa < load_lsa ||
++            code[i].size > span || code[i].lsa - load_lsa > span - code[i].size) return 0;
++        total += code[i].size;
++    }
++    spu_overlay_code_segment* copy = (spu_overlay_code_segment*)malloc(count * sizeof *copy + total);
++    if (!copy) return 0;
++    uint8_t* bytes = (uint8_t*)(copy + count);
++    for (unsigned i = 0; i < count; ++i) {
++        copy[i] = code[i];
++        memcpy(bytes, code[i].bytes, code[i].size);
++        copy[i].bytes = bytes;
++        bytes += code[i].size;
++    }
++    const int n = s_ovl_static_count;
++    s_ovl_static[n].owner = owner_image_id; s_ovl_static[n].image_id = image_id;
++    s_ovl_static[n].lsa = load_lsa; s_ovl_static[n].span = span;
++    s_ovl_static[n].code = copy; s_ovl_static[n].count = count;
++    __atomic_store_n(&s_ovl_static_count, n + 1, __ATOMIC_RELEASE);
++    return 1;
++}
++
++/* A dispatch miss at lsa: is a registered static overlay of this context's
++ * image there, with its bytes in local store? Then make its span resident
++ * (verified) and return its image id, else 0. */
++static int spu_overlay_static_adopt(spu_context* ctx, uint32_t lsa)
++{
++    const int n = __atomic_load_n(&s_ovl_static_count, __ATOMIC_ACQUIRE);
++    for (int i = 0; i < n; ++i) {
++        if (s_ovl_static[i].owner != ctx->image_id || lsa < s_ovl_static[i].lsa ||
++            lsa - s_ovl_static[i].lsa >= s_ovl_static[i].span) continue;
++        /* Overlays that take turns in one span differ in their first bytes:
++         * check those first, so a miss for the other one (the interpreter asks
++         * on every instruction it runs) costs 16 bytes, not the whole span. */
++        if (memcmp(ctx->ls + s_ovl_static[i].code[0].lsa, s_ovl_static[i].code[0].bytes,
++                   s_ovl_static[i].code[0].size < 16 ? s_ovl_static[i].code[0].size : 16)) continue;
++        int match = 1;
++        for (unsigned k = 0; match && k < s_ovl_static[i].count; ++k) {
++            const uint8_t* l = ctx->ls + s_ovl_static[i].code[k].lsa;
++            const uint8_t* b = s_ovl_static[i].code[k].bytes;
++            if (memcmp(l, b, s_ovl_static[i].code[k].size)) {
++                static int _m = 0;
++                if (PS3_LOG_FIRST(_m, 16)) {
++                    uint32_t o = 0; while (l[o] == b[o]) o++;
++                    fprintf(stderr, "[spu-ovl] img=%d static overlay image %d not resident: LS 0x%05X differs "
++                            "(miss at 0x%05X) LS:", ctx->image_id, s_ovl_static[i].image_id,
++                            s_ovl_static[i].code[k].lsa + o, lsa);
++                    for (int q = 0; q < 16; q++) fprintf(stderr, "%02X", l[(o & ~15u) + q]);
++                    fprintf(stderr, "\n");
++                }
++                match = 0;
++            }
++        }
++        if (!match) continue;   /* another overlay may take turns in the same span */
++        unsigned slot = 0;
++        while (slot < 4 && ctx->resident_code[slot].image_id) slot++;
++        if (slot == 4) slot = 3;   /* all taken: replace the last */
++        ctx->resident_code[slot].lsa = s_ovl_static[i].lsa;
++        ctx->resident_code[slot].size = s_ovl_static[i].span;
++        ctx->resident_code[slot].source_ea = 0xFFFFFFFFu;   /* any DMA into the span ends residency */
++        ctx->resident_code[slot].image_id = s_ovl_static[i].image_id;
++        ctx->resident_code[slot].verify_state = 0;
++        ctx->resident_code[slot].source_index = 0;
++        spu_dcache_residency_changed(ctx);
++        { static int _n = 0; if (PS3_LOG_FIRST(_n, 16))
++            fprintf(stderr, "[spu-ovl] img=%d static overlay image %d resident at LS 0x%05X (+0x%X)\n",
++                    ctx->image_id, s_ovl_static[i].image_id, s_ovl_static[i].lsa, s_ovl_static[i].span); }
++        return s_ovl_static[i].image_id;
++    }
++    return 0;
++}
++
+ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+ {
+     int* state = &ctx->resident_code[slot].verify_state;
+@@ -2871,7 +2997,28 @@ void spu_indirect_branch(spu_context* ctx)
+               if (PS3_LOG_FIRST(_n, 8))
+                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                           "(runtime-loaded code)\n", ctx->image_id, p);
+-              spu_interp_run(ctx, p);
++              /* Stop at the enclosing call's return point, as the microstep
++               * hand-off does: a lifted image calling runtime-loaded code
++               * (spu_lifter --external-calls) sets it to the call's return. */
++              /* SPU_UNLIFTED_LOG=1: each distinct address interpreted here, once --
++               * the entry points a lift of the run-time code is missing.
++               * SPU_UNLIFTED_LSDUMP=<file>: the local store at the 2000th one,
++               * to find what was loaded where. */
++              { static uint32_t seen[512]; static int ns = 0; int k = 0;
++                for (; k < ns; k++) if (seen[k] == p) break;
++                if (k == ns && ns < 512 && getenv("SPU_UNLIFTED_LOG")) { seen[ns++] = p;
++                  fprintf(stderr, "[unlifted-entry] 0x%05X lr=0x%05X\n", p, ctx->gpr[0]._u32[0] & SPU_LS_MASK); } }
++              { static int _dumped = 0; const char* dp = getenv("SPU_UNLIFTED_LSDUMP");
++                if (dp && !_dumped) { static unsigned _k; if (++_k == 2000) { _dumped = 1; FILE* lf = fopen(dp, "wb");
++                  if (lf) { fwrite(ctx->ls, 1, SPU_LS_SIZE, lf); fclose(lf); fprintf(stderr, "[spu] LS dumped to %s\n", dp); } } } }
++              /* Interpret to that return point without rejoining lifted code
++               * on the way: a rejoin at a function the interpreted code calls
++               * returns into the middle of the interpreted one, where no host
++               * frame is waiting. */
++              const int si = ctx->image_id;
++              if (ctx->drain_ret_pc) ctx->image_id = -1;
++              spu_interp_run_until(ctx, p, ctx->drain_ret_pc);
++              ctx->image_id = si;
+               return;
+           } }
+         spu_halt(ctx);
+diff --git a/runtime/spu/spu_overlay_residency.h b/runtime/spu/spu_overlay_residency.h
+index 08af5b1..c749d9d 100644
+--- a/runtime/spu/spu_overlay_residency.h
++++ b/runtime/spu/spu_overlay_residency.h
+@@ -29,6 +29,18 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+     uint32_t span, int image_id, const spu_overlay_code_segment* code,
+     unsigned count);
+ 
++/* Register code a program loads into its own local store at run time from a
++ * source whose main-memory address is not fixed (SEGA Rally's MultiStream
++ * loads flashATRAC.pic from /dev_flash into a heap buffer, and two of the
++ * title's own SPU images, at fixed local-store addresses). Its functions were
++ * lifted at load_lsa under image_id. A dispatch miss in a context running
++ * owner_image_id inside [load_lsa, load_lsa + span) compares the segments with
++ * local store; on a match the span becomes resident (verified) in a free
++ * resident-code slot, and any later DMA into the span ends that, as for
++ * spu_overlay_register_verified_region. Returns 1 on success. */
++int spu_overlay_register_static(int owner_image_id, uint32_t load_lsa, uint32_t span,
++    int image_id, const spu_overlay_code_segment* code, unsigned count);
++
+ #ifdef __cplusplus
+ }
+ #endif

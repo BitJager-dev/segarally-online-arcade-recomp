@@ -18,15 +18,19 @@ Progress and known problems are tracked in the [issues](https://github.com/BitJa
 | Extract the PKG (base + 1.01 update) | done: `tools/ps3_pkg_extract.py` |
 | Decrypt `EBOOT.BIN` (retail NPDRM SELF, key rev 0x10 in 1.01) | done: `tools/ps3_unself.py` -> `game/EBOOT.elf` (PPC64, entry 0x5D26F0) |
 | Analysis, function finding, PPU lift (`tools/recomp_pipeline.sh`) | done: 25,339 functions, 1,215 HLE handlers |
-| Game project (CMake from ps3recomp's template), Linux build + test boot | builds (container); boots past the intro (skipped) through the menus into a race that renders correctly past one minute (Vulkan, game shaders) |
-| SPU programs | 5 of 6 lifted and registered; the 69 KB one has data inside its code |
-| Audio: the Multistream SPU program (the 69 KB image) calls into `flashATRAC.pic`, firmware SPU code it loads at run time, so that code has to be lifted at its load address too. Until then `SPU_MB_ACK` answers its commands (no sound) and the intro movie is skipped | next |
+| Game project (CMake from ps3recomp's template), Linux build + test boot | builds (container); plays the intro movie, the menus and a full race with its replay (Vulkan, game shaders) |
+| SPU programs | 6 of 6 lifted, plus the code the audio program loads at run time (below) |
+| Audio | plays: the MultiStream SPU program, the ATRAC decoder it loads from `/dev_flash` (`flashATRAC.pic`) and three of the game's SPU images it swaps in are lifted at the addresses they run at (`tools/lift_spu_overlays.py`) |
 
 ## Building (Linux)
 `tools/build_linux.sh` configures and builds `out/linux/segarally_online_arcade`, stages the game data as
 `run/dev_hdd0/game/NPUB30375` (base + 1.01; `PS3_HDD0_ROOT`), and boots it for 60 s into `logs/boot.log`.
 Needs clang, ninja, SDL2; install `vulkan-headers` for the Vulkan renderer (otherwise the headless null
 renderer). `JOBS=` sets parallel compiles (default 6: each lifted file is ~600k lines).
+
+Requirements to run: an x86-64 CPU with AVX2 (Intel Haswell / AMD Zen or later; the SPU code is built for
+x86-64-v3, `PORT_SPU_X86_LEVEL`: with SSE4.2 only the audio mixer cannot keep up and the sound breaks up), a
+Vulkan GPU, and your firmware's `/dev_flash` (below) for sound.
 
 ## Building in a container
 `tools/docker_build.sh` builds in `docker/Dockerfile` (Arch, the same clang, glslang, SPIRV-Tools and SDL2 as the
@@ -40,7 +44,8 @@ keys are read from RPCS3's open-source `key_vault.cpp`/`.h`, downloaded to `../d
 sets up ps3recomp's Python environment and runs `tools/recomp_pipeline.sh`. Log: `setup_ps3.log`.
 
 Firmware: `tools/ps3_pup_devflash.py PS3UPDAT.PUP ../deps/ps3fw/root --keys ../deps/rpcs3src` installs `/dev_flash`
-(same RPCS3 key source as the EBOOT); `build_linux.sh` uses it when present.
+(same RPCS3 key source as the EBOOT); `build_linux.sh` uses it when present, and the build lifts the audio
+decoder from it (without it there is no sound).
 
 `USRDIR/KEY.EDAT` is NPDRM-encrypted data the game reads at runtime; the port's `cellFs`/EDAT layer has to
 decrypt it with the same license.
@@ -52,8 +57,9 @@ decrypt it with the same license.
 | `tools/ps3_unself.py` | NPDRM SELF -> ELF with the title's RAP (port of RPCS3's `unself.cpp`; keys loaded from RPCS3's source at run time) |
 | `tools/ps3_pup_devflash.py` | `/dev_flash` from an official `PS3UPDAT.PUP` (port of RPCS3's firmware installer) |
 | `tools/setup_ps3.sh` | One-shot setup: decrypt, Python environment, pipeline |
-| `tools/recomp_pipeline.sh` | ps3recomp phases 3-5: ELF/imports, functions, SPU images, PPU lift, HLE table |
-| `patches/` | ps3recomp runtime fixes for this title, applied by `build_linux.sh`: blocked event waits deliver GCM callbacks (Linux), SPU group thread slots, answers for a stopped audio SPU, Vulkan 3D textures, ZPASS pixel counts (occlusion queries), a flip-time ring wrap that no longer overwrites commands the GPU has not read, flips that complete one at a time after the GPU has run past them (the main loop no longer needs `EVT_RECV_KICK`), cellVoice notify queues (its thread blocks instead of spinning), SPU job workers that back off while they poll an unchanged line (`SPU_POLL_SPIN`), `sys_mempool_*`, `cellUsbdRegisterExtraLdd2`, `UTF8stoUCS2s` and the sceNp custom-menu calls (registered in `stubs.cpp`, since the NID generator only picks up cell*/sce*/sys* names) |
+| `tools/recomp_pipeline.sh` | ps3recomp phases 3-5: ELF/imports, functions, SPU images, PPU lift |
+| `tools/lift_spu_overlays.py` | Lifts the code the MultiStream audio program loads at run time, at the addresses it runs at (run by CMake) |
+| `patches/` | ps3recomp fixes for this title (against ps3recomp `4e8f3ca`), applied by `build_linux.sh`: lifting SPU programs with data in their code and calls into run-time code (`--runtime-code`, `spu_lifter --external-calls`), lifted run-time overlays checked against local store (`spu_overlay_register_static`), real-time audio mixing on Linux, blocked event waits deliver GCM callbacks (Linux), SPU group thread slots, answers for a stopped audio SPU, Vulkan 3D textures, ZPASS pixel counts (occlusion queries), a flip-time ring wrap that no longer overwrites commands the GPU has not read, flips that complete one at a time after the GPU has run past them (the main loop no longer needs `EVT_RECV_KICK`), cellVoice notify queues (its thread blocks instead of spinning), SPU job workers that back off while they poll an unchanged line (`SPU_POLL_SPIN`), `sys_mempool_*`, `cellUsbdRegisterExtraLdd2`, `UTF8stoUCS2s` and the sceNp custom-menu calls (registered in `stubs.cpp`, since the NID generator only picks up cell*/sce*/sys* names) |
 | `tools/docker_build.sh`, `docker/Dockerfile` | Container build environment |
 | `game/` | Your decrypted `EBOOT.elf` (not in git) |
 | `analysis/`, `generated/` | Pipeline output (not in git). The HLE NID table is generated by CMake in the build tree, so new handlers in ps3recomp are picked up on the next build |

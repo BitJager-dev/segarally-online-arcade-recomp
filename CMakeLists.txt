@@ -150,10 +150,22 @@ if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(_spu_cmd "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/build_spu_workloads.py"
         --lifted "${_spu_out}" --out "${_spu_out}/spu_workloads.c" --constructor --allow-partial)
+    # The MultiStream audio program (the 69 KB image): its code range holds data, and it
+    # calls into flashATRAC.pic, which it loads from /dev_flash at run time. Lift it anyway:
+    # the data words stay traps that never run, and calls out of the image are dispatched at
+    # run time (interpreted until that code is lifted too).
+    set(PORT_SPU_RUNTIME_CODE "spu_4671d2e3de50519b2a162e089634d3a05973ff53ebe68df393a5d03b03db6f13"
+        CACHE STRING "SPU programs (content names) lifted with --runtime-code")
+    foreach(name IN LISTS PORT_SPU_RUNTIME_CODE)
+        list(APPEND _spu_cmd --runtime-code "${name}")
+    endforeach()
     foreach(input IN LISTS PORT_SPU_INPUTS)
         get_filename_component(input "${input}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
         list(APPEND _spu_cmd --input "${input}")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+    endforeach()
+    foreach(tool IN ITEMS build_spu_workloads.py spu_program_pipeline.py spu_lifter.py find_spu_functions.py)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PS3RECOMP_DIR}/tools/${tool}")
     endforeach()
     execute_process(COMMAND ${_spu_cmd} RESULT_VARIABLE _spu_rc OUTPUT_VARIABLE _spu_log ERROR_VARIABLE _spu_err)
     message(STATUS "SPU: ${_spu_log}")
@@ -163,6 +175,32 @@ if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
     include("${_spu_out}/sources.cmake")
     list(APPEND SPU_SOURCES ${SPU_GENERATED_SOURCES}
          "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+
+    # The code MultiStream loads at run time: flashATRAC.pic from your firmware's /dev_flash
+    # and two of the game's own SPU images, lifted at the local-store addresses they run at
+    # (tools/lift_spu_overlays.py). Without the firmware they are interpreted (slowly: the
+    # sound then breaks up).
+    set(PORT_FLASH_ATRAC_PIC "${CMAKE_CURRENT_SOURCE_DIR}/../deps/ps3fw/root/dev_flash/sys/external/flashATRAC.pic"
+        CACHE FILEPATH "flashATRAC.pic from the firmware's /dev_flash")
+    set(PORT_SPU_IMAGES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/analysis/spu_programs"
+        CACHE PATH "The extracted SPU images (tools/build_linux.sh writes them)")
+    if(EXISTS "${PORT_FLASH_ATRAC_PIC}" AND EXISTS "${PORT_SPU_IMAGES_DIR}")
+        set(_ovl_out "${CMAKE_CURRENT_BINARY_DIR}/generated_spu_ovl")
+        execute_process(COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/tools/lift_spu_overlays.py"
+                                --pic "${PORT_FLASH_ATRAC_PIC}" --spu-dir "${PORT_SPU_IMAGES_DIR}"
+                                --out "${_ovl_out}" --tools "${PS3RECOMP_DIR}/tools"
+                        RESULT_VARIABLE _ovl_rc OUTPUT_VARIABLE _ovl_log ERROR_VARIABLE _ovl_err)
+        if(NOT _ovl_rc EQUAL 0)
+            message(FATAL_ERROR "SPU overlay lifting failed:\n${_ovl_log}\n${_ovl_err}")
+        endif()
+        message(STATUS "SPU overlays: ${_ovl_log}")
+        include("${_ovl_out}/sources.cmake")
+        list(APPEND SPU_SOURCES ${SPU_OVERLAY_SOURCES})
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                     "${PORT_FLASH_ATRAC_PIC}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/lift_spu_overlays.py")
+    else()
+        message(STATUS "SPU overlays: no ${PORT_FLASH_ATRAC_PIC} -- MultiStream's run-time code is interpreted")
+    endif()
 elseif(PORT_ENABLE_SPU)
     file(GLOB SPU_LIFTED CONFIGURE_DEPENDS "${SPU_DIR}/*/spu_recomp.c")
     if(SPU_LIFTED)
@@ -210,8 +248,18 @@ if(SPU_SOURCES)
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS SPU_USE_DISPATCH_MT)
+    # PORT_SPU_X86_LEVEL: the x86-64 level the SPU code is built for. The SPU helpers have
+    # SSE4.1 paths (shufb and the integer ops) and AVX2 paths (the float ops, exact to the
+    # SPU's rounding); below them they fall back to per-byte/per-lane C, several times
+    # slower. The audio mixer (MultiStream) needs the AVX2 paths to keep up in real time.
+    set(PORT_SPU_X86_LEVEL "x86-64-v3" CACHE STRING
+        "-march level for the lifted SPU code (x86-64-v3 = AVX2, Haswell/Zen and later; x86-64-v2 = SSE4.2)")
     if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64" AND PORT_SPU_X86_LEVEL)
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-march=${PORT_SPU_X86_LEVEL}")
+        else()
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+        endif()
     endif()
 endif()
 

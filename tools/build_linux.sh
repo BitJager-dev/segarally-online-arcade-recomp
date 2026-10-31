@@ -83,10 +83,10 @@ if [[ ! -f "$TITLE/.staged" ]]; then
   touch "$TITLE/.staged"
 fi
 
-# SKIP_INTRO=1 (default): the intro movie (LOGOS.USM) stalls after ~50 frames without the audio
-# engine, and the game skips a movie it cannot open. Only the run/ copy is renamed.
+# SKIP_INTRO=1 skips the intro movie (LOGOS.USM): the game skips a movie it cannot open, so only
+# the run/ copy is renamed. Off by default since the audio engine runs.
 MOV="$TITLE/USRDIR/MOVIES/LOGOS.USM"
-if [[ "${SKIP_INTRO:-1}" == 1 ]]; then [[ -f "$MOV" ]] && mv "$MOV" "$MOV.skip"
+if [[ "${SKIP_INTRO:-0}" == 1 ]]; then [[ -f "$MOV" ]] && mv "$MOV" "$MOV.skip"
 else [[ -f "$MOV.skip" ]] && mv "$MOV.skip" "$MOV"; fi
 
 BOOT_SECONDS="${BOOT_SECONDS:-60}"
@@ -99,16 +99,15 @@ cd "$ROOT/run"
 # written to logs/frame.ppm (converted to logs/frame.png below).
 rm -f "$ROOT/logs/frame.ppm" "$ROOT/logs/frame.png"
 [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && export PS3RECOMP_VK_WINDOW="${PS3RECOMP_VK_WINDOW:-1}"
-# SPU_MB_ACK=0x2A: the MultiStream audio SPU program needs firmware code it loads at run time
-# (flashATRAC.pic), which is not lifted, so it stops at once. Commands the game sends it are
-# answered on its reply port (0x2A) instead, and the game runs without sound.
-# /dev_flash from your firmware (tools/ps3_pup_devflash.py); the game's audio library loads its
-# ATRAC decoder from it.
+# /dev_flash from your firmware (tools/ps3_pup_devflash.py): the MultiStream audio SPU program
+# loads its ATRAC decoder (flashATRAC.pic) from it. The build lifts that decoder at the address
+# it runs at (tools/lift_spu_overlays.py); SPU_INTERP_UNLIFTED=1 interprets any run-time SPU
+# code that has no lifted copy instead of stopping the SPU there.
 FLASH="$DEPS/ps3fw/root/dev_flash"
 [[ -d "$FLASH" ]] && export PS3_DEV_FLASH="${PS3_DEV_FLASH:-$FLASH}"
 PS3RECOMP_VK_GUEST_PROGRAMS="${PS3RECOMP_VK_GUEST_PROGRAMS:-1}" \
 PS3RECOMP_VK_DUMP="$ROOT/logs/frame.ppm" PS3RECOMP_VK_DUMP_EVERY=60 \
-SPU_MB_ACK="${SPU_MB_ACK:-0x2A}" PS3_VERBOSE="${PS3_VERBOSE:-0}" PS3_HDD0_ROOT="$HDD0" PS3_VFS_ROOT="$TITLE" PS3_STDIO_UNBUFFERED=1 \
+SPU_INTERP_UNLIFTED="${SPU_INTERP_UNLIFTED:-1}" PS3_VERBOSE="${PS3_VERBOSE:-0}" PS3_HDD0_ROOT="$HDD0" PS3_VFS_ROOT="$TITLE" PS3_STDIO_UNBUFFERED=1 \
   timeout -s KILL "$BOOT_SECONDS" "$EXE" "$ROOT/game/EBOOT.elf" > "$ROOT/logs/boot.log" 2>&1
 rc=$?
 echo "exit code: $rc (137 = stopped by the ${BOOT_SECONDS} s timer)"
