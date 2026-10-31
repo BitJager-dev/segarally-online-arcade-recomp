@@ -419,3 +419,95 @@ index a25ecc2..5619b05 100644
  
      /* Optional, both or neither: clear_color and clear_depth_stencil limited
       * to the rectangle (x, y, w, h) of the target, in the engine's pixels
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index e31b611..ba95911 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -364,7 +364,7 @@ int rsx_vertex_fetch_many(
+         const u32 fstride = fetch->stride;
+         const u32 modulo = (plan->divider_mask >> attr) & 1u;
+         const int plain = rsx_vertex_freq_plain(fetch->desc.frequency, modulo);
+-        const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
++        u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
+         switch (type) {
+         case RSX_VTX_TYPE_FLOAT:
+             RSX_FETCH_LOOP(v[c] = rsx_compact_be_f32(src + c * 4))
+@@ -385,10 +385,20 @@ int rsx_vertex_fetch_many(
+             RSX_FETCH_LOOP(v[c] = (float)(s16)((src[c * 2] << 8) | src[c * 2 + 1]))
+             break;
+         default:   /* RSX_VTX_TYPE_CMP32: one packed word, whatever the size */
+-            for (u32 i = 0; i < count; i++)
+-                if (!rsx_vertex_fetch_attr_value(plan, attr, &refs[i],
+-                        (float*)(out + (size_t)i * stride + slot * 16u)))
+-                    return 0;
++            /* Signed 11:11:10, as rsx_vertex_decode_element reads it; the
++             * loop runs once (n = 1) and writes all four components. */
++            n = 1;
++            RSX_FETCH_LOOP({
++                const u32 word = ((u32)src[0] << 24) | ((u32)src[1] << 16) |
++                                 ((u32)src[2] << 8) | (u32)src[3];
++                const s32 x = (s32)(word << 21) >> 21;
++                const s32 y = (s32)(word << 10) >> 21;
++                const s32 z = (s32)word >> 22;
++                v[0] = (float)x / 1023.0f;
++                v[1] = (float)y / 1023.0f;
++                v[2] = (float)z / 511.0f;
++                v[3] = 1.0f;
++            })
+             break;
+         }
+     }
+@@ -427,8 +437,26 @@ int rsx_vertex_remap_build(
+ 
+     if (count > UINT_MAX / 2u)
+         return 0;
++    /* Index ranges are usually compact: every reference shares one base and
++     * the ids span little more than the draw. Then the table is indexed by
++     * id - min directly (one sequential pass, no hashing). Otherwise a hash
++     * table sized to this draw, not to the largest one so far: a probe into
++     * a table sized for the biggest draw ever missed the cache on every
++     * reference, ~20% of the FIFO thread in SEGA Rally's race. */
++    u32 vmin = UINT_MAX, vmax = 0;
++    int one_base = 1;
++    const u32 base0 = refs[0].base_index;
++    for (u32 i = 0; i < count; i++) {
++        const u32 v = refs[i].vertex_id;
++        if (v < vmin) vmin = v;
++        if (v > vmax) vmax = v;
++        one_base &= refs[i].base_index == base0;
++    }
++    const u64 range = (u64)vmax - vmin + 1u;
++    const int dense = one_base && range <= (1u << 22) &&
++                      range <= ((u64)count * 4u > 4096u ? (u64)count * 4u : 4096u);
+     u32 slot_capacity = 16u;
+-    const u32 required_slots = count * 2u;
++    const u32 required_slots = dense ? (u32)range : count * 2u;
+     while (slot_capacity < required_slots) {
+         if (slot_capacity > UINT_MAX / 2u)
+             return 0;
+@@ -454,7 +482,24 @@ int rsx_vertex_remap_build(
+     }
+ 
+     u32 unique = 0;
+-    const u32 mask = remap->slot_capacity - 1u;
++    if (dense) {
++        for (u32 occurrence = 0; occurrence < count; occurrence++) {
++            const rsx_vertex_ref ref = refs[occurrence];
++            rsx_vertex_remap_slot* slot = &remap->slots[ref.vertex_id - vmin];
++            if (slot->generation != remap->generation) {
++                slot->value = unique;
++                slot->generation = remap->generation;
++                refs[unique] = ref;
++                remap->occurrence_to_unique[occurrence] = unique;
++                unique++;
++            } else {
++                remap->occurrence_to_unique[occurrence] = slot->value;
++            }
++        }
++        *unique_count = unique;
++        return 1;
++    }
++    const u32 mask = slot_capacity - 1u;   /* this draw's size, within the allocation */
+     for (u32 occurrence = 0; occurrence < count; occurrence++) {
+         const rsx_vertex_ref ref = refs[occurrence];
+         const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
