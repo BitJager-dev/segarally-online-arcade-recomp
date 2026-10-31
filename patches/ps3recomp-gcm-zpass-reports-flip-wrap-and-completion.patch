@@ -252,10 +252,28 @@ index 298ee7d..ee722a0 100644
      }
      vm_write32(ctx + 8, cur + 4);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff601..c59c567 100644
+index 8dff601..780cdf5 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1083,12 +1083,12 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+@@ -106,6 +106,9 @@ typedef struct {
+     rsx_be_format fmt;
+     u32 handle;
+     u32 feedback;          /* last immutable own-target copy, engine-owned */
++    u32 conv;              /* color_as_format texture, and what it was made from: */
++    u64 conv_serial;       /*   color_serial,                                     */
++    u32 conv_fmt, conv_w, conv_h;   /* base format and size                       */
+     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+     int guest_dirty;        /* rendered since guest memory last got a copy   */
+     u32 last_use;           /* g.frames when last bound, sampled or presented */
+@@ -699,6 +702,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+ 
+     eng_surface* s = &g.surfaces[slot];
+     if (s->feedback) { g.be->texture_release(g.be->user, s->feedback); s->feedback = 0; }
++    s->conv = 0;   /* the backend's, released with the target */
+     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+     s->location = location; s->offset = offset;
+     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
+@@ -1083,12 +1087,12 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
      const int z16 = z->zfmt == 1u;      /* SURFACE_FORMAT Z16 */
      const int bytes = base_fmt == RSX_TEX_FMT_A8R8G8B8 && !z16 && !rsx_texture_argb_is_rgba();
      const int d16 = base_fmt == RSX_TEX_FMT_DEPTH16 && z16;
@@ -270,7 +288,7 @@ index 8dff601..c59c567 100644
      if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
          t->pitch != z->pitch)
          return 0;
-@@ -1097,7 +1097,9 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+@@ -1097,7 +1101,9 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
          const u32 tex = g.be->depth_as_color(g.be->user, z->handle, t->width, t->height,
                                               base_fmt);
          if (!tex) return 0;
@@ -281,7 +299,7 @@ index 8dff601..c59c567 100644
          z->conv = tex;
          z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
          z->conv_serial = z->depth_serial;
-@@ -1322,9 +1324,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1322,9 +1328,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
   * cache full evicts the least recently used entry rather than returning
   * nothing: returning white "made the recovered orphanage render as flat
   * green/black geometry" (rsx_live_draw.c:2326-2334). */
@@ -310,7 +328,7 @@ index 8dff601..c59c567 100644
      if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
      if (!depth) depth = 1;
      const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
-@@ -1372,6 +1393,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1372,6 +1397,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
               * stored hash becomes unknown and the next ordinary check
               * re-uploads once rather than miss a change. */
              if (e->rewritten && readable) {
@@ -318,7 +336,7 @@ index 8dff601..c59c567 100644
                  hash = ~e->content_hash;
                  e->rewritten = 0;
              } else if (readable && (sparse != e->sparse_hash ||
-@@ -1382,6 +1404,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1382,6 +1408,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              if (readable) e->sparse_hash = sparse;
              e->last_hash_frame = g.frames;
              if (readable && hash != e->content_hash) {
@@ -329,7 +347,7 @@ index 8dff601..c59c567 100644
                  /* In place when the backend orders the upload after the draws
                   * that sampled the old bytes; a volume keeps create-and-swap,
                   * and so does a different mip count (the key does not hold it,
-@@ -1412,7 +1438,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1412,7 +1442,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
                  index = i;
          evicted = g.textures[index].handle;
@@ -339,7 +357,7 @@ index 8dff601..c59c567 100644
  
      eng_texture e;
      memset(&e, 0, sizeof(e));
-@@ -1661,6 +1689,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
+@@ -1661,6 +1693,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
      return mask;
  }
  
@@ -351,3 +369,53 @@ index 8dff601..c59c567 100644
  /* Units bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3 with a
   * depth), declared Texture3D and sampled with three coordinates. Only when
   * the backend can create one: otherwise the first slice stays a 2D texture
+@@ -2564,6 +2601,29 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             }
+             continue;
+         }
++        /* An RGBA8 target read as Y16_X16 (a shadow map packed into colour):
++         * converted by the backend in command order when it can, once per
++         * colour write, instead of stored to guest memory and decoded. */
++        if (sampled >= 0 && zsrc < 0 && base_fmt == 0x95u && g.be->color_as_format &&
++            g.be->surface_view && g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
++            (t.format & RSX_TEX_FMT_LINEAR) && !t.cubemap && t.dimension == 2 &&
++            t.mipmaps <= 1 && t.width && t.height && t.width <= g.surfaces[sampled].w &&
++            t.height <= g.surfaces[sampled].h && t.pitch == g.surfaces[sampled].pitch) {
++            eng_surface* s = &g.surfaces[sampled];
++            if (!s->conv || s->conv_serial != s->color_serial || s->conv_fmt != base_fmt ||
++                s->conv_w != t.width || s->conv_h != t.height) {
++                const u32 tex = g.be->color_as_format(g.be->user, s->handle, t.width, t.height, base_fmt);
++                /* A failed conversion leaves the old texture to the backend
++                 * (it goes with the target) and takes guest memory below. */
++                if (tex && s->conv && s->conv != tex) g.be->texture_release(g.be->user, s->conv);
++                if (tex) s->conv = tex;
++                s->conv_serial = tex ? s->color_serial : 0;
++                s->conv_fmt = base_fmt; s->conv_w = t.width; s->conv_h = t.height;
++            }
++            const u32 view = (s->conv && s->conv_serial == s->color_serial)
++                ? g.be->surface_view(g.be->user, s->conv, t.remap & 0xFFFFu, t.format) : 0;
++            if (view) { textures[u] = view; continue; }
++        }
+         if (sampled >= 0 && zsrc < 0 &&
+             g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
+             eng_format_reinterprets_rgba8(base_fmt) &&
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index a25ecc2..5619b05 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -281,6 +281,15 @@ typedef struct rsx_draw_backend {
+      * owns the handle. 0 when the backend cannot; NULL keeps the store
+      * through guest memory. */
+     u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
++    /* Optional. An R8G8B8A8 colour target's top-left w x h read as a
++     * texture of base format `rsx_fmt` with the target's own pitch: a texture
++     * (for surface_view) holding what storing the target into guest memory
++     * and decoding it would give. Y16_X16 (0x95) only: X = A:R, Y = G:B of
++     * the stored A,R,G,B bytes. Made in command order; the backend owns it and
++     * may refill and return the same texture each time (the engine releases a
++     * different one it replaces). 0 when it cannot; NULL keeps the store
++     * through guest memory. */
++    u32  (*color_as_format)(void* user, u32 surface, u32 w, u32 h, u32 rsx_fmt);
+ 
+     /* Optional, both or neither: clear_color and clear_depth_stencil limited
+      * to the rectangle (x, y, w, h) of the target, in the engine's pixels
