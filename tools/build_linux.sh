@@ -94,9 +94,6 @@ echo "== Test boot (${BOOT_SECONDS} s) -> logs/boot.log"
 cd "$ROOT/run"
 # PS3_VERBOSE=1 logs every syscall: gigabytes a minute, and it changes the timing enough to
 # hide or cause hangs. Off by default here.
-# EVT_RECV_KICK=2:20: queue 2 is the game's flip queue. Its main loop sleeps there until the RSX
-# has written the frame label and re-checks the label on every wake, so a re-delivered event
-# after 20 ms idle is harmless; without it a flip event that beats the label write hangs it.
 # PS3RECOMP_VK_GUEST_PROGRAMS=1: translate the game's own shaders (without it every frame is black).
 # PS3RECOMP_VK_WINDOW=1 shows the output when a display is available; every 60th frame is also
 # written to logs/frame.ppm (converted to logs/frame.png below).
@@ -111,7 +108,7 @@ FLASH="$DEPS/ps3fw/root/dev_flash"
 [[ -d "$FLASH" ]] && export PS3_DEV_FLASH="${PS3_DEV_FLASH:-$FLASH}"
 PS3RECOMP_VK_GUEST_PROGRAMS="${PS3RECOMP_VK_GUEST_PROGRAMS:-1}" \
 PS3RECOMP_VK_DUMP="$ROOT/logs/frame.ppm" PS3RECOMP_VK_DUMP_EVERY=60 \
-SPU_MB_ACK="${SPU_MB_ACK:-0x2A}" EVT_RECV_KICK="${EVT_RECV_KICK:-2:20}" PS3_VERBOSE="${PS3_VERBOSE:-0}" PS3_HDD0_ROOT="$HDD0" PS3_VFS_ROOT="$TITLE" PS3_STDIO_UNBUFFERED=1 \
+SPU_MB_ACK="${SPU_MB_ACK:-0x2A}" PS3_VERBOSE="${PS3_VERBOSE:-0}" PS3_HDD0_ROOT="$HDD0" PS3_VFS_ROOT="$TITLE" PS3_STDIO_UNBUFFERED=1 \
   timeout -s KILL "$BOOT_SECONDS" "$EXE" "$ROOT/game/EBOOT.elf" > "$ROOT/logs/boot.log" 2>&1
 rc=$?
 echo "exit code: $rc (137 = stopped by the ${BOOT_SECONDS} s timer)"
@@ -119,7 +116,6 @@ echo "boot log: $(wc -l < "$ROOT/logs/boot.log") lines"
 tail -25 "$ROOT/logs/boot.log"
 echo "== How far it got"
 grep -E "^\[fs\] open '" "$ROOT/logs/boot.log" | tail -5
-echo "flip-queue kicks: $(grep -c 'EVT_RECV_KICK' "$ROOT/logs/boot.log")"
 if [[ -f "$ROOT/logs/frame.ppm" ]]; then
   python3 -I - "$ROOT/logs/frame.ppm" "$ROOT/logs/frame.png" <<'PY' && echo "last frame: logs/frame.png"
 import sys, zlib, struct
