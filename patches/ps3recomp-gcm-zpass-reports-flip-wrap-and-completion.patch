@@ -1,5 +1,5 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 298ee7d..6b5c39c 100644
+index 298ee7d..ee722a0 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -135,10 +135,26 @@ static volatile int s_flip_direct_pending = 0;
@@ -106,7 +106,7 @@ index 298ee7d..6b5c39c 100644
      wprof_note_walker();
      g_gcm_drain_tid = GetCurrentThreadId();
      const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-@@ -2000,6 +2042,16 @@ static int gcm_word_diag(void)
+@@ -2000,6 +2042,29 @@ static int gcm_word_diag(void)
  
  /* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
   * plus the methods whose answer the walker writes itself. */
@@ -114,16 +114,29 @@ index 298ee7d..6b5c39c 100644
 + * Weak, so a backend without them links and keeps the 0xFFFF answer. */
 +#if defined(__GNUC__) || defined(__clang__)
 +extern uint32_t rsx_backend_zpass_report(void) __attribute__((weak));
++extern uint32_t rsx_backend_zpass_report_async(uint64_t tag) __attribute__((weak));
 +extern void rsx_backend_zpass_clear(void) __attribute__((weak));
 +#else
 +static uint32_t (*const rsx_backend_zpass_report)(void) = NULL;
++static uint32_t (*const rsx_backend_zpass_report_async)(uint64_t) = NULL;
 +static void (*const rsx_backend_zpass_clear)(void) = NULL;
 +#endif
++
++/* A report the backend answered before its draws finished
++ * (rsx_backend_zpass_report_async): the exact count, into the same place.
++ * Tag: bit 32 set for a main-memory report (low word its EA), else the index
++ * into the local report area. Only the value: the timestamp stays the one the
++ * GET_REPORT wrote. */
++void gcm_zpass_report_resolved(uint64_t tag, uint32_t value)
++{
++    if (tag >> 32) vm_write32((u32)tag + 8u, value);
++    else if ((u32)tag < CELL_GCM_MAX_REPORT_COUNT) s_report_data[(u32)tag].value = value;
++}
 +
  static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
  {
      extern u32 g_rsx_last_reference;
-@@ -2020,9 +2072,29 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+@@ -2020,9 +2085,37 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
       * reports "visible" -- the conservative answer; reading 0
       * tells the title every queried object is occluded. */
      if (m == 0x1A8) s_report_dma = v;
@@ -140,7 +153,15 @@ index 298ee7d..6b5c39c 100644
          const u32 off = v & 0xFFFFFFu, idx = off / 16u;
 -        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
 +        u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-+        if ((v >> 24) == 1u && rsx_backend_zpass_report) {
++        const int report_main = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
++        if ((v >> 24) == 1u && rsx_backend_zpass_report_async) {
++            const u32 rea = report_main ? gcm_io2ea(off) : 0u;
++            if (!report_main || rea) {
++                const uint64_t tag = report_main ? (1ull << 32) | rea : (uint64_t)idx;
++                const u32 n = rsx_backend_zpass_report_async(tag);
++                if (n != 0xFFFFFFFFu) val = n;
++            }
++        } else if ((v >> 24) == 1u && rsx_backend_zpass_report) {
 +            const u32 n = rsx_backend_zpass_report();
 +            if (n != 0xFFFFFFFFu) val = n;
 +        }
@@ -154,7 +175,7 @@ index 298ee7d..6b5c39c 100644
          const u64 ts = gcm_report_timestamp();
          const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
          { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
-@@ -2122,6 +2194,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2122,6 +2215,20 @@ static void gcm_rsx_process_fifo_unlocked(void)
      }
  
      u32 start_off = s_fifo_getoff;
@@ -175,7 +196,7 @@ index 298ee7d..6b5c39c 100644
      /* GCM_DRAINDBG: log one drain pass in GCM_DRAINDBG_EVERY (default 60). */
      static int s_drain_every = -1;
      if (s_drain_every < 0) { const char* e = getenv("GCM_DRAINDBG_EVERY");
-@@ -2165,10 +2251,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2165,10 +2272,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
       * bad branch, which is exactly the case where the drift is silent. */
      { static int snap = -1;
        if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
@@ -193,7 +214,7 @@ index 298ee7d..6b5c39c 100644
                u32 gio = s_fifo_getoff + (u32)(k * 4), pio = put + (u32)(k * 4);
                u32 gea = gcm_io2ea(gio), pea = gcm_io2ea(pio);
                fprintf(stderr, "[SNAP]  get+%-3d io=%08X w=%08X   put+%-3d io=%08X w=%08X\n",
-@@ -2398,7 +2488,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2398,7 +2509,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
          }
          if ((w & 3) == 2) {                    /* CALL: offset | 2 */
              { u32 tgt = w & 0x1FFFFFFCu;
@@ -202,7 +223,7 @@ index 298ee7d..6b5c39c 100644
                s_fifo_calloff = s_fifo_getoff + 4;
                s_fifo_getoff  = tgt; }
              continue;
-@@ -3171,10 +3261,26 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+@@ -3171,10 +3282,26 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
      const u32 cb_opd = vm_read32(ctx + 0xC);
      const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
@@ -231,10 +252,36 @@ index 298ee7d..6b5c39c 100644
      }
      vm_write32(ctx + 8, cur + 4);
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index 8dff601..4f7f225 100644
+index 8dff601..c59c567 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
-@@ -1322,9 +1322,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1083,12 +1083,12 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+     const int z16 = z->zfmt == 1u;      /* SURFACE_FORMAT Z16 */
+     const int bytes = base_fmt == RSX_TEX_FMT_A8R8G8B8 && !z16 && !rsx_texture_argb_is_rgba();
+     const int d16 = base_fmt == RSX_TEX_FMT_DEPTH16 && z16;
++    const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
++    const u32 used_h = z->used_h < z->h ? z->used_h : z->h;
+     if (s_depth_via_guest || !g.be->depth_as_color || !g.be->surface_view ||
+         !z->handle || !(bytes || d16) || !(t->format & RSX_TEX_FMT_LINEAR) ||
+         t->cubemap || t->dimension == 3 || t->mipmaps > 1)
+         return 0;
+-    const u32 used_w = z->used_w < z->w ? z->used_w : z->w;
+-    const u32 used_h = z->used_h < z->h ? z->used_h : z->h;
+     if (!t->width || !t->height || t->width > used_w || t->height > used_h ||
+         t->pitch != z->pitch)
+         return 0;
+@@ -1097,7 +1097,9 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
+         const u32 tex = g.be->depth_as_color(g.be->user, z->handle, t->width, t->height,
+                                              base_fmt);
+         if (!tex) return 0;
+-        if (z->conv) g.be->texture_release(g.be->user, z->conv);
++        /* A backend may refill and return the same texture (Vulkan keeps one
++         * per depth target): only a different one replaces the old. */
++        if (z->conv && z->conv != tex) g.be->texture_release(g.be->user, z->conv);
+         z->conv = tex;
+         z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
+         z->conv_serial = z->depth_serial;
+@@ -1322,9 +1324,28 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
   * cache full evicts the least recently used entry rather than returning
   * nothing: returning white "made the recovered orphanage render as flat
   * green/black geometry" (rsx_live_draw.c:2326-2334). */
@@ -263,7 +310,7 @@ index 8dff601..4f7f225 100644
      if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
      if (!depth) depth = 1;
      const u32 span = depth > 1 ? eng_texture_span_3d(fmt, w, h, depth, levels, pitch)
-@@ -1372,6 +1391,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1372,6 +1393,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
               * stored hash becomes unknown and the next ordinary check
               * re-uploads once rather than miss a change. */
              if (e->rewritten && readable) {
@@ -271,18 +318,18 @@ index 8dff601..4f7f225 100644
                  hash = ~e->content_hash;
                  e->rewritten = 0;
              } else if (readable && (sparse != e->sparse_hash ||
-@@ -1382,6 +1402,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1382,6 +1404,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              if (readable) e->sparse_hash = sparse;
              e->last_hash_frame = g.frames;
              if (readable && hash != e->content_hash) {
 +                if (eng_tex_stats_on()) { s_ts.changed++; s_ts.bytes += span;
-+                    static unsigned nl; if (g.frames > 2000 && nl < 24) { nl++;
++                    static unsigned nl; if (getenv("ENG_TEX_LOG") && nl < 100000) { nl++;
 +                        fprintf(stderr, "[tex] re-decode loc%u off 0x%08X fmt 0x%02X %ux%u lv%u pitch %u depth %u span %u%s\n",
 +                                location, offset, fmt, w, h, levels, pitch, depth, span, e->rewritten ? " (rewritten)" : ""); } }
                  /* In place when the backend orders the upload after the draws
                   * that sampled the old bytes; a volume keeps create-and-swap,
                   * and so does a different mip count (the key does not hold it,
-@@ -1412,7 +1436,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1412,7 +1438,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
              if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
                  index = i;
          evicted = g.textures[index].handle;
@@ -292,7 +339,7 @@ index 8dff601..4f7f225 100644
  
      eng_texture e;
      memset(&e, 0, sizeof(e));
-@@ -1661,6 +1687,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
+@@ -1661,6 +1689,11 @@ static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
      return mask;
  }
  
