@@ -261,6 +261,17 @@ if(SPU_SOURCES)
             set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
         endif()
     endif()
+    # PORT_SPU_AUDIO_FAST_FLOAT: the audio program (MultiStream, image spu_4671d2e3...) and the
+    # code it loads at run time use the host's float add/multiply/FMA instead of the exact SPU
+    # rounding (SPU_FLOAT_FAST in spu_helpers.h): its ATRAC decoder is all float butterflies,
+    # and with the exact ops a Ryzen 7840HS decoded ~80% of real time (the sound broke up). The
+    # difference is the last bit of a sample. Every other SPU program keeps the exact ops.
+    option(PORT_SPU_AUDIO_FAST_FLOAT "Native float ops for the audio SPU code" ON)
+    if(PORT_SPU_AUDIO_FAST_FLOAT)
+        set(_audio_spu ${SPU_SOURCES})
+        list(FILTER _audio_spu INCLUDE REGEX "spu_4671d2e3|generated_spu_ovl/")
+        set_property(SOURCE ${_audio_spu} APPEND PROPERTY COMPILE_DEFINITIONS SPU_FLOAT_FAST)
+    endif()
 endif()
 
 # app.rc carries the icon, the version block and the manifest, and needs a
@@ -282,6 +293,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
+# The whole program at the SPU code's x86-64 level (AVX2 + FMA, PORT_SPU_X86_LEVEL). The lifted PPU
+# code's AltiVec helpers use fmaf per lane, which at the default x86-64 level is a libm call in
+# software: vmaddfp alone was a third of SEGA Rally's main thread.
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64" AND PORT_SPU_X86_LEVEL)
+    target_compile_options(${PROJECT_NAME} PRIVATE -march=${PORT_SPU_X86_LEVEL})
+    target_compile_options(ps3recomp_runtime PRIVATE -march=${PORT_SPU_X86_LEVEL})
+endif()
+
 # PORT_ASAN=ON: AddressSanitizer for the runtime, the SPU code and the runner -- not the
 # lifted PPU code (huge, and guest memory is not the host heap). A diagnostic build, in
 # its own build directory.
@@ -291,6 +310,13 @@ if(PORT_ASAN AND NOT MSVC)
     set_property(SOURCE ${SPU_SOURCES} main.cpp stubs.cpp APPEND PROPERTY COMPILE_OPTIONS
                  -fsanitize=address -fno-omit-frame-pointer)
     target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address)
+endif()
+
+# PORT_RUNTIME_DEBUGINFO=ON: line tables for the runtime only (profiling: a gdb sample then
+# names the line in the draw engine, not just the function). The optimisation stays.
+option(PORT_RUNTIME_DEBUGINFO "Debug line info for the runtime (profiling)" OFF)
+if(PORT_RUNTIME_DEBUGINFO AND NOT MSVC)
+    target_compile_options(ps3recomp_runtime PRIVATE -g)
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE

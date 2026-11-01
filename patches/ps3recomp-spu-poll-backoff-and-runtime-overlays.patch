@@ -1,5 +1,5 @@
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index 5fc5020..abff458 100644
+index 5fc5020..c9f819a 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -577,6 +577,38 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
@@ -49,7 +49,36 @@ index 5fc5020..abff458 100644
          /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
           * used and the first word as it lands in BOTH places.
           *
-@@ -1715,6 +1748,8 @@ int spu_have_function(uint32_t addr)
+@@ -1316,6 +1349,28 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
+ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+ {
+     spu_honour_stop_request(ctx);
++    /* SPU_MBOX_IDLE=1: per SPU thread, the share of time it spins on an empty
++     * inbound mailbox (waiting for the PPU to hand it work) vs everything
++     * else, every 5 s. Tells "the SPU is too slow" from "the SPU waits". */
++    if (channel == SPU_RdInMbox) {
++        static int s_mi = -1;
++        if (s_mi < 0) s_mi = getenv("SPU_MBOX_IDLE") ? 1 : 0;
++        if (s_mi) {
++            static _Thread_local uint64_t t_win, t_idle, t_since; static _Thread_local unsigned t_jobs;
++            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++            const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++            if (!t_win) t_win = now;
++            if (ctx->ch_in_mbox.count == 0) { if (!t_since) t_since = now; }
++            else if (t_since) { t_idle += now - t_since; t_since = 0; t_jobs++; }
++            if (now - t_win >= 5000000000ull) {
++                if (t_since) { t_idle += now - t_since; t_since = now; }
++                fprintf(stderr, "[spu-mbox] spu %u img %d: waiting for work %.1f%%, %u jobs, %.3f ms busy per job\n",
++                        (unsigned)ctx->spu_id, ctx->image_id, 100.0 * t_idle / (now - t_win), t_jobs,
++                        t_jobs ? (now - t_win - t_idle) / 1e6 / t_jobs : 0.0);
++                t_win = now; t_idle = 0; t_jobs = 0;
++            }
++        }
++    }
+     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
+      * with the pc each SPU is sitting at.
+      *
+@@ -1715,6 +1770,8 @@ int spu_have_function(uint32_t addr)
   * through would execute stale code registered under another image. Task and
   * unbounded overlay misses retain their existing primary-image fallback. */
  static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot);
@@ -58,7 +87,7 @@ index 5fc5020..abff458 100644
  static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa)
  {
      /* Every probe below goes through #436's per-thread memo rather than
-@@ -1736,6 +1771,10 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
+@@ -1736,6 +1793,10 @@ static spu_lifted_fn spu_lifted_lookup_full(const spu_context* ctx, uint32_t lsa
      if (ctx->resident_task) fn = spu_lookup_memoized(lsa, ctx->resident_task);
      if (!fn && ctx->resident_ovl) fn = spu_lookup_memoized(lsa, ctx->resident_ovl);
      if (!fn) fn = spu_lookup_memoized(lsa, ctx->image_id);
@@ -69,7 +98,7 @@ index 5fc5020..abff458 100644
      return (spu_lifted_fn)fn;
  }
  
-@@ -1942,6 +1981,93 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+@@ -1942,6 +2003,93 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
      return 1;
  }
  
@@ -163,7 +192,7 @@ index 5fc5020..abff458 100644
  static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
  {
      int* state = &ctx->resident_code[slot].verify_state;
-@@ -2871,7 +2997,28 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2871,7 +3019,49 @@ void spu_indirect_branch(spu_context* ctx)
                if (PS3_LOG_FIRST(_n, 8))
                    fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                            "(runtime-loaded code)\n", ctx->image_id, p);
@@ -188,7 +217,28 @@ index 5fc5020..abff458 100644
 +               * frame is waiting. */
 +              const int si = ctx->image_id;
 +              if (ctx->drain_ret_pc) ctx->image_id = -1;
++              /* SPU_INTERP_STATS=1: time spent interpreting, per 5 s, and the
++               * entry that took most of it. */
++              static int s_ist = -1;
++              if (s_ist < 0) s_ist = getenv("SPU_INTERP_STATS") ? 1 : 0;
++              struct timespec i0, i1;
++              if (s_ist) clock_gettime(CLOCK_MONOTONIC, &i0);
 +              spu_interp_run_until(ctx, p, ctx->drain_ret_pc);
++              if (s_ist) {
++                  static _Atomic uint64_t tot_ns, t_last, calls; static uint32_t top_pc; static uint64_t top_ns;
++                  clock_gettime(CLOCK_MONOTONIC, &i1);
++                  const uint64_t now = (uint64_t)i1.tv_sec * 1000000000ull + i1.tv_nsec;
++                  const uint64_t d = now - ((uint64_t)i0.tv_sec * 1000000000ull + i0.tv_nsec);
++                  tot_ns += d; calls++;
++                  if (d > top_ns) { top_ns = d; top_pc = p; }
++                  if (!t_last) t_last = now;
++                  if (now - t_last > 5000000000ull) {
++                      fprintf(stderr, "[spu-interp] %.1f%% of a core, %llu calls in %.1f s; longest %.2f ms at LS 0x%05X\n",
++                              100.0 * tot_ns / (now - t_last), (unsigned long long)calls, (now - t_last) / 1e9,
++                              top_ns / 1e6, top_pc);
++                      tot_ns = 0; calls = 0; top_ns = 0; t_last = now;
++                  }
++              }
 +              ctx->image_id = si;
                return;
            } }

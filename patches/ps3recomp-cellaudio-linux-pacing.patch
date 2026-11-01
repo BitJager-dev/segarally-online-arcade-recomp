@@ -1,5 +1,5 @@
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index 02b751b..ceb0fef 100644
+index 02b751b..30a685c 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
 @@ -20,6 +20,7 @@
@@ -19,7 +19,7 @@ index 02b751b..ceb0fef 100644
      want.callback = NULL; /* We'll use SDL_QueueAudio */
  
      s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-@@ -209,12 +210,21 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+@@ -209,12 +210,26 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
      }
  }
  
@@ -27,11 +27,8 @@ index 02b751b..ceb0fef 100644
 +/* SDL queues without bound: keep PS3_AUDIO_BUF_MS (default 64 ms, twelve
 + * blocks) ahead of the device. Four blocks (21 ms) underran PipeWire under
 + * load -- a shader compile, a busy core -- and every underrun is a pop. */
- static int audio_backend_room(void)
- {
-     if (!s_sdl_audio_dev) return -1;
--    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
--           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
++static u32 audio_backend_target_samples(void)
++{
 +    static u32 ahead = 0;
 +    if (!ahead) {
 +        const char* e = getenv("PS3_AUDIO_BUF_MS");
@@ -39,12 +36,77 @@ index 02b751b..ceb0fef 100644
 +        ahead = (u32)ms * CELL_AUDIO_SAMPLE_RATE / 1000u;
 +        if (ahead < CELL_AUDIO_BLOCK_SAMPLES * 2) ahead = CELL_AUDIO_BLOCK_SAMPLES * 2;
 +    }
-+    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) < ahead
++    return ahead;
++}
++
+ static int audio_backend_room(void)
+ {
+     if (!s_sdl_audio_dev) return -1;
+-    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
+-           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
++    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) < audio_backend_target_samples()
 +           ? CELL_AUDIO_BLOCK_SAMPLES : 0;
  }
  
  static void audio_backend_wait(void) { SDL_Delay(1); }
-@@ -649,22 +659,56 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+@@ -433,6 +448,46 @@ static inline float ld_be_f32(const float* p)
+     return f;
+ }
+ 
++/* Wait (up to PS3_AUDIO_LATE_MS, default 4 ms) for a writer that is late with
++ * the block about to be mixed: one of a running port whose last block held
++ * sound and whose next one is still all zero (cleared when it was last
++ * consumed, not written since). The PS3 mixes on the clock regardless, but a
++ * PS3 SPU is never descheduled; SEGA Rally's MultiStream writer, an SPU thread
++ * among dozens on a PC, sometimes is, and every block it misses plays as a
++ * zeroed hole -- a pop at each end. The device queue holds tens of ms, so a
++ * few ms of patience cost nothing audible. */
++static int s_port_live[CELL_AUDIO_PORT_MAX];
++static unsigned s_late_ok, s_late_timeout; static uint64_t s_late_ns;   /* AUDIO_RATE */
++#ifndef _WIN32
++static void audio_wait_late_writer(void)
++{
++    static int64_t late_ns = -1;
++    if (late_ns < 0) {
++        const char* e = getenv("PS3_AUDIO_LATE_MS");
++        late_ns = (int64_t)(e ? atoi(e) : 4) * 1000000;
++    }
++    if (late_ns <= 0) return;
++    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
++    for (;;) {
++        int waiting = 0;
++        for (int p = 0; p < CELL_AUDIO_PORT_MAX && !waiting; p++) {
++            const AudioPortSlot* port = &s_ports[p];
++            if (!s_port_live[p] || !port->in_use || !port->running || !port->buffer) continue;
++            const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
++            const u32* src = (const u32*)(port->buffer + (u32)(port->read_index % nblock) * CELL_AUDIO_BLOCK_SAMPLES * nch);
++            u32 any = 0;
++            for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES * nch; s++) any |= src[s];
++            waiting = !any;
++        }
++        struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
++        const int64_t el = (int64_t)(t.tv_sec - t0.tv_sec) * 1000000000 + (t.tv_nsec - t0.tv_nsec);
++        if (!waiting) { if (el > 100000) { s_late_ok++; s_late_ns += (uint64_t)el; } return; }
++        if (el >= late_ns) { s_late_timeout++; return; }
++        usleep(200);
++    }
++}
++#endif
++
+ /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+ static void audio_mix_one_block(void)
+ {
+@@ -521,6 +576,9 @@ static void audio_mix_one_block(void)
+         /* Firmware clears a ring-buffer block after consuming it. Besides
+          * preventing stale PCM from replaying when a producer stalls, the
+          * cleared block is an observable consumption signal for producers. */
++        {   u32 any = 0;
++            for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2++) any |= ((const u32*)src)[s2];
++            s_port_live[p] = any != 0; }
+         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+ 
+         /* Keep the monotonic counter for tags/timestamps, but publish the
+@@ -649,22 +707,76 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      return 0;
  }
  #else
@@ -66,16 +128,33 @@ index 02b751b..ceb0fef 100644
 +     * paces its own mixer on these block notifications, so a fast clock plays
 +     * its audio fast. With a device: stay about four blocks ahead of it. With
 +     * none: the monotonic clock. */
-+    const uint64_t t_start = audio_now_ns();
-+    unsigned long long blocks = 0;
++    /* Every block on the clock, with or without a device. Mixing whenever the
++     * SDL queue had room consumed blocks in bursts of four (SDL drains its
++     * queue a device period at a time): SEGA Rally's MultiStream writer then
++     * fell a lap behind its 8-block ring and a whole lap (43 ms) played
++     * cleared blocks, a pop at each end, ~8 a second. The queue depth only
++     * steers the period by 2% towards PS3_AUDIO_BUF_MS, and a stall rebases
++     * the clock instead of catching up in a burst. */
++    const uint64_t period = (uint64_t)CELL_AUDIO_BLOCK_SAMPLES * 1000000000ull / CELL_AUDIO_SAMPLE_RATE;
++    uint64_t due = audio_now_ns();
++    (void)audio_backend_wait;
      while (s_mix_thread_running) {
-+        const int room = audio_backend_room();
-+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
-+        if (room < 0) {
-+            const uint64_t due = t_start + blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ull / CELL_AUDIO_SAMPLE_RATE;
-+            if (audio_now_ns() < due) { usleep(1000); continue; }
++        const uint64_t now = audio_now_ns();
++        if (now < due) {
++            struct timespec ts = { (time_t)(due / 1000000000ull), (long)(due % 1000000000ull) };
++            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
++            continue;
 +        }
-+        blocks++;
++        if (now > due + 4 * period) due = now;      /* stalled: start over, no burst */
++        uint64_t next = period;
++        if (audio_backend_room() >= 0) {
++            const u32 q = audio_backend_queued_samples(), target = audio_backend_target_samples();
++            if (q > target + CELL_AUDIO_BLOCK_SAMPLES * 4) { due += period; continue; }   /* far ahead: hold a tick */
++            if (q > target) next = period + period / 50;
++            else if (q < target) next = period - period / 50;
++        }
++        due += next;
++        audio_wait_late_writer();
          audio_mix_one_block();
 +        /* AUDIO_PEAK=1 / AUDIO_WAV=<file> / AUDIO_RATE=1: as on Windows. */
 +        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
@@ -94,8 +173,11 @@ index 02b751b..ceb0fef 100644
 +            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
 +              if (!nz) z++; }
 +            if (now - t0 >= 5000000000ull) {
-+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%\n",
-+                        n * 1e9 / (double)(now - t0), n ? 100.0 * z / n : 0.0);
++                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, "
++                        "late writer: %u waited (avg %.2f ms), %u gave up\n",
++                        n * 1e9 / (double)(now - t0), n ? 100.0 * z / n : 0.0,
++                        s_late_ok, s_late_ok ? s_late_ns / 1e6 / s_late_ok : 0.0, s_late_timeout);
++                s_late_ok = s_late_timeout = 0; s_late_ns = 0;
 +                n = z = 0; t0 = now; } } }
          audio_notify_event_queues();
 -
