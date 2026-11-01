@@ -1,5 +1,5 @@
 diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
-index 9626673..bb07d18 100644
+index 9626673..1f90070 100644
 --- a/runtime/syscalls/lv2_register.c
 +++ b/runtime/syscalls/lv2_register.c
 @@ -521,6 +521,14 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
@@ -33,7 +33,15 @@ index 9626673..bb07d18 100644
  #ifdef _WIN32
  static DWORD WINAPI spu_exec_thread_proc(LPVOID arg)
  #else
-@@ -735,13 +752,20 @@ static void* spu_exec_thread_proc(void* arg)
+@@ -732,16 +749,24 @@ static void* spu_exec_thread_proc(void* arg)
+             g->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
+         }
+     }
++    /* A word written while the run was ending was never read; with
++     * SPU_MB_ACK, answer it as the mailbox handler answers later ones. Before
++     * the run is reported finished: after that the context may be freed. */
++    if (spu_mb_ack_port() >= 0 && spu_channel_has_data(&t->sctx->ch_in_mbox))
++        spu_mb_ack_dead(t, (uint32_t)spu_mb_ack_port(), spu_channel_read(&t->sctx->ch_in_mbox));
  #ifdef _WIN32
      t->running = 0;
      SetEvent(t->finish_event);
@@ -45,17 +53,52 @@ index 9626673..bb07d18 100644
      pthread_cond_broadcast(&t->finish_event.cv);
      pthread_mutex_unlock(&t->finish_event.mu);
 +#endif
-+    /* A word written while the run was ending was never read; with
-+     * SPU_MB_ACK, answer it as the mailbox handler answers later ones. */
-+    if (spu_mb_ack_port() >= 0 && spu_channel_has_data(&t->sctx->ch_in_mbox))
-+        spu_mb_ack_dead(t, (uint32_t)spu_mb_ack_port(), spu_channel_read(&t->sctx->ch_in_mbox));
 +#ifdef _WIN32
 +    return 0;
 +#else
      return NULL;
  #endif
  }
-@@ -1026,7 +1050,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+@@ -961,6 +986,38 @@ static int spu_thread_image_id(const spu_thread_t* t)
+     return spu_thread_image(t, &src, &fp, &iid, &registered) && registered ? iid : 0;
+ }
+ 
++/* Ask a thread running its lifted image on a host thread to stop (it halts at
++ * its next channel operation, spu_honour_stop_request) and wait up to `ms`
++ * for the host thread to leave. Returns 1 when it no longer runs.
++ *
++ * group_terminate used to mark the group stopped and leave the host threads
++ * running, and group_destroy then freed their contexts and local stores
++ * under them: SEGA Rally destroys and recreates SPU groups at every track
++ * change, and its job workers kept polling in freed memory -- heap
++ * corruption (malloc aborts, a NULL ctx->ls in spu_indirect_branch, crashes
++ * inside the Vulkan driver) a few track changes in. */
++static int spu_thread_stop_and_wait(spu_thread_t* t, unsigned ms)
++{
++    if (!t->running) return 1;
++    if (t->sctx) t->sctx->stop_request = 1;
++#ifdef _WIN32
++    if (t->finish_event) WaitForSingleObject(t->finish_event, ms);
++#else
++    struct timespec dl;
++    clock_gettime(CLOCK_REALTIME, &dl);
++    dl.tv_sec += ms / 1000u;
++    dl.tv_nsec += (long)(ms % 1000u) * 1000000L;
++    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
++    pthread_mutex_lock(&t->finish_event.mu);
++    while (!t->finish_event.done)
++        if (pthread_cond_timedwait(&t->finish_event.cv, &t->finish_event.mu, &dl) != 0) break;
++    pthread_mutex_unlock(&t->finish_event.mu);
++#endif
++    if (t->running)
++        fprintf(stderr, "[SPU] tid=0x%X did not stop within %u ms\n", t->tid, ms);
++    return !t->running;
++}
++
+ /* sys_spu_thread_group_start(id) */
+ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+ {
+@@ -1026,7 +1083,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
      int spawned = 0;
      int instant = 0;
      int nofb    = 0;   /* subset of `instant` that had no fallback at all */
@@ -64,7 +107,18 @@ index 9626673..bb07d18 100644
          uint32_t idx = g->thread_indices[i];
          if (idx >= MAX_SPU_THREADS) continue;
          spu_thread_t* t = &s_spu_threads[idx];
-@@ -1261,7 +1285,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
+@@ -1038,6 +1095,10 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+          * waits on a fallback thread. Images with no lifted code fall through
+          * to the fallback and interpreter paths below, unchanged. */
+         if (spu_lifted_thread_available(t->entry_point)) {
++            /* A context its previous host thread still runs on is never
++             * re-initialised: stop that run first, and if it will not stop,
++             * give this run a new context and leave the old one to it. */
++            if (t->sctx && t->running && !spu_thread_stop_and_wait(t, 1000)) t->sctx = NULL;
+             if (!t->sctx) t->sctx = (spu_context*)calloc(1, sizeof(spu_context));
+             if (t->sctx) {
+                 spu_lifted_thread_desc d;
+@@ -1261,7 +1322,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
       * back results. */
      if (g->state == SPU_GROUP_STATE_RUNNING) {
          int32_t worst = 0;
@@ -73,7 +127,7 @@ index 9626673..bb07d18 100644
              uint32_t idx = g->thread_indices[i];
              if (idx >= MAX_SPU_THREADS) continue;
              spu_thread_t* t = &s_spu_threads[idx];
-@@ -1340,7 +1364,7 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
+@@ -1340,18 +1401,16 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
      }
      spu_group_t* g = spu_find_group(id);
      if (g) {
@@ -82,7 +136,36 @@ index 9626673..bb07d18 100644
              uint32_t idx = g->thread_indices[i];
              if (idx < MAX_SPU_THREADS) {
                  spu_thread_t* t = &s_spu_threads[idx];
-@@ -1493,6 +1517,18 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
+-                if (t->local_store) {
+-                    free(t->local_store);
+-                    t->local_store = NULL;
+-                }
+-                if (t->sctx) {
+-                    free(t->sctx);
+-                    t->sctx = NULL;
+-                }
++                /* Free nothing a host thread still uses (leak it instead). */
++                const int stopped = spu_thread_stop_and_wait(t, 2000);
++                if (t->local_store && stopped) free(t->local_store);
++                t->local_store = NULL;
++                if (t->sctx && stopped) free(t->sctx);
++                t->sctx = NULL;
+                 t->in_use = 0;
+             }
+         }
+@@ -1376,6 +1435,11 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
+         g->state = SPU_GROUP_STATE_STOPPED;
+         g->cause = SPU_GROUP_CAUSE_TERMINATED;
+         g->exit_status = status;
++        for (int i = 0; i < 8; i++) {
++            const uint32_t idx = g->thread_indices[i];
++            if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use)
++                spu_thread_stop_and_wait(&s_spu_threads[idx], 1000);
++        }
+     }
+     fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d\n", id, status);
+     fflush(stderr);
+@@ -1493,6 +1557,18 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
          return CELL_OK;
      }
  
@@ -101,7 +184,7 @@ index 9626673..bb07d18 100644
      /* Preferred path: the worker is alive and blocked in rdch on its own host
       * thread. Write its mailbox and wake it, so it resumes exactly where it was
       * with its registers intact. */
-@@ -1800,6 +1836,15 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
+@@ -1800,6 +1876,15 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
                  spu_id, is_intr, value, q); }
  }
  
